@@ -353,31 +353,47 @@ func newCmdTrustBundleWait() *cobra.Command {
 	options := newTrustBundleOptions()
 	var skiFlag string
 	var timeoutDuration string
+	var secretName string
+	var secretNamespace string
 
 	cmd := &cobra.Command{
 		Use:   "wait <cert-file>",
 		Short: "Wait for a certificate to appear in the trust bundle",
 		Long: `Wait for a certificate to appear in the trust bundle in the linkerd-identity-trust-roots ConfigMap.
 
-The certificate can be specified either as a PEM file or by Subject Key ID using the --id flag.
-This command polls the ConfigMap until the certificate appears or the timeout expires.`,
+The certificate can be specified as a PEM file, by Subject Key ID using the --id flag,
+or from a Secret using the --secret flag. This command polls the ConfigMap until the
+certificate appears or the timeout expires.`,
 		Example: `  # Wait for a certificate to appear in the trust bundle
   linkerd trust bundle wait anchor.crt
 
   # Wait for a certificate by Subject Key ID with custom timeout
   linkerd trust bundle wait --id 8b5d19a740e9f20b4d2f645e5496ce491f5821dd --timeout 5m
 
+  # Wait for a certificate from a Secret
+  linkerd trust bundle wait --secret linkerd-trust-anchor -n cert-manager
+
   # Wait for a certificate to appear in a custom ConfigMap
   linkerd trust bundle wait anchor.crt --configmap my-trust-roots -L my-namespace`,
 		Args:         cobra.MaximumNArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Validate that either file or --id is provided, but not both
-			if len(args) == 0 && skiFlag == "" {
-				return fmt.Errorf("must specify either a certificate file or use --id flag")
+			// Validate that exactly one of file, --id, or --secret is provided
+			specifiedCount := 0
+			if len(args) > 0 {
+				specifiedCount++
 			}
-			if len(args) > 0 && skiFlag != "" {
-				return fmt.Errorf("cannot specify both a certificate file and --id flag")
+			if skiFlag != "" {
+				specifiedCount++
+			}
+			if secretName != "" {
+				specifiedCount++
+			}
+			if specifiedCount == 0 {
+				return fmt.Errorf("must specify either a certificate file, --id flag, or --secret flag")
+			}
+			if specifiedCount > 1 {
+				return fmt.Errorf("cannot specify more than one of: certificate file, --id flag, or --secret flag")
 			}
 
 			k8sAPI, err := k8s.NewAPI(kubeconfigPath, kubeContext, impersonate, impersonateGroup, 0)
@@ -398,6 +414,17 @@ This command polls the ConfigMap until the certificate appears or the timeout ex
 			if skiFlag != "" {
 				// Use the provided SKI
 				targetSKI = strings.ToLower(strings.ReplaceAll(skiFlag, ":", ""))
+			} else if secretName != "" {
+				// Read from Secret
+				if secretNamespace == "" {
+					secretNamespace = controlPlaneNamespace
+				}
+				cert, err := utils.GetCertFromSecret(ctx, k8sAPI, secretNamespace, secretName)
+				if err != nil {
+					return fmt.Errorf("failed to get certificate from Secret %s/%s: %w", secretNamespace, secretName, err)
+				}
+				targetSKI = utils.GetSubjectKeyID(cert)
+				fmt.Printf("Loaded certificate %s from Secret %s/%s\n", cert.Subject.CommonName, secretNamespace, secretName)
 			} else {
 				// Read from file
 				certFile := args[0]
@@ -469,6 +496,8 @@ This command polls the ConfigMap until the certificate appears or the timeout ex
 
 	cmd.Flags().StringVar(&options.configMapName, "configmap", utils.TrustRootsConfigMapName, "Name of the trust roots ConfigMap")
 	cmd.Flags().StringVar(&skiFlag, "id", "", "Subject Key ID of the certificate to wait for (hex format)")
+	cmd.Flags().StringVar(&secretName, "secret", "", "Name of the Secret containing the certificate to wait for")
+	cmd.Flags().StringVarP(&secretNamespace, "secret-namespace", "n", "", "Namespace of the Secret (defaults to control plane namespace)")
 	cmd.Flags().StringVar(&timeoutDuration, "timeout", "1m", "Maximum time to wait (e.g., 30s, 1m, 5m)")
 
 	return cmd
