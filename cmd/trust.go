@@ -10,6 +10,7 @@ import (
 
 	"github.com/grantae/certinfo"
 	"github.com/linkerd/linkerd-trust/v2/pkg/utils"
+	ourx509 "github.com/linkerd/linkerd-trust/v2/pkg/x509"
 	pkgcmd "github.com/linkerd/linkerd2/pkg/cmd"
 	"github.com/linkerd/linkerd2/pkg/k8s"
 	pkgtls "github.com/linkerd/linkerd2/pkg/tls"
@@ -126,24 +127,28 @@ exist.`,
 				return err
 			}
 
-			newCerts, err := utils.LoadCertsFromFile(certFile)
+			// Load the new certificates as a bundle.
+			newCertBundle, err := ourx509.NewBundleFromFile(certFile)
 
 			if err != nil {
 				return fmt.Errorf("could not load certificates from %s: %w", certFile, err)
 			}
 
-			// Get or create the ConfigMap
+			// Set up to load our existing trust bundle.
+			existingBundle := ourx509.NewBundle()
+
+			// Does our ConfigMap already exist?
+			mustCreate := false
 			ctx := cmd.Context()
 			configMap, err := k8sAPI.CoreV1().ConfigMaps(controlPlaneNamespace).Get(ctx, options.configMapName, metav1.GetOptions{})
-			var existingBundle string
-			var existingCerts []*x509.Certificate
 
 			if err != nil {
-				// ConfigMap doesn't exist
+				// No. If we're not allowed to create it, that's an error.
 				if !options.create {
 					return fmt.Errorf("ConfigMap %s/%s not found (use --create to create it): %w", controlPlaneNamespace, options.configMapName, err)
 				}
 
+				mustCreate = true
 				configMap = &corev1.ConfigMap{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      options.configMapName,
@@ -155,57 +160,27 @@ exist.`,
 				fmt.Printf("Creating ConfigMap %s/%s\n", controlPlaneNamespace, options.configMapName)
 			} else {
 				// ConfigMap exists, get existing trust bundle
-				existingBundle, existingCerts, err = utils.LoadCertsFromBundle(configMap)
+				existingBundle.LoadFromConfigMap(configMap, "")
 
 				if err != nil {
 					return fmt.Errorf("could not load existing trust bundle: %w", err)
 				}
 			}
 
-			// Check for duplicates based on Subject Key ID
-			existingCertIDs := make(map[string]any, len(existingCerts))
-
-			for _, cert := range existingCerts {
-				ski := utils.GetSubjectKeyID(cert)
-				existingCertIDs[ski] = struct{}{}
-			}
-
-			var newCertsPEM []string
-
-			for _, newCert := range newCerts {
-				newSKI := utils.GetSubjectKeyID(newCert)
-
-				_, exists := existingCertIDs[newSKI]
-
-				if exists {
-					fmt.Printf("Certificate with Subject Key ID %s already exists in trust bundle, skipping\n", newSKI)
+			// Add new certs only.
+			for cert := range newCertBundle.All() {
+				if !existingBundle.Contains(cert) {
+					existingBundle.Add(cert)
+					fmt.Printf("Added certificate %s (SKI: %s) to trust bundle\n", cert.Subject.CommonName, utils.GetSubjectKeyID(cert))
 				} else {
-					fmt.Printf("Adding certificate %s (SKI: %s) to trust bundle\n", newCert.Subject.CommonName, newSKI)
-					certPEM := string(pkgtls.EncodeCertificatesPEM(newCert))
-					newCertsPEM = append(newCertsPEM, certPEM)
+					fmt.Printf("Certificate %s (SKI: %s) already exists in trust bundle, skipping\n", cert.Subject.CommonName, utils.GetSubjectKeyID(cert))
 				}
 			}
 
-			if len(newCertsPEM) == 0 {
-				fmt.Println("All certificates already exist in trust bundle, nothing to add")
-				return nil
-			}
-
-			// Add new certificates to the bundle
-			var newBundle strings.Builder
-			if existingBundle != "" {
-				newBundle.WriteString(strings.TrimSpace(existingBundle))
-				newBundle.WriteString("\n")
-			}
-
-			for _, certData := range newCertsPEM {
-				newBundle.WriteString(string(certData))
-			}
-
 			// Update or create the ConfigMap
-			configMap.Data[utils.TrustRootsDataKey] = newBundle.String()
+			configMap.Data[utils.TrustRootsDataKey] = existingBundle.PEM()
 
-			if existingBundle == "" && len(existingCerts) == 0 {
+			if mustCreate {
 				// Create new ConfigMap
 				_, err = k8sAPI.CoreV1().ConfigMaps(controlPlaneNamespace).Create(ctx, configMap, metav1.CreateOptions{})
 				if err != nil {
@@ -217,11 +192,6 @@ exist.`,
 				if err != nil {
 					return fmt.Errorf("failed to update ConfigMap: %w", err)
 				}
-			}
-
-			for _, cert := range newCerts {
-				ski := utils.GetSubjectKeyID(cert)
-				fmt.Printf("Added certificate %s (SKI: %s) to trust bundle\n", cert.Subject.CommonName, ski)
 			}
 
 			return nil
@@ -278,14 +248,10 @@ certificate, or using the --id SKI to give its full hex Subject Key ID.`,
 			}
 
 			// Get existing trust bundle
-			existingBundle := configMap.Data[utils.TrustRootsDataKey]
-			if existingBundle == "" {
-				return fmt.Errorf("trust bundle is empty")
-			}
+			existingBundle, err := ourx509.NewBundleFromConfigMap(configMap, "")
 
-			existingCerts, err := pkgtls.DecodePEMCertificates(existingBundle)
 			if err != nil {
-				return fmt.Errorf("failed to parse existing trust bundle: %w", err)
+				return fmt.Errorf("could not load existing trust bundle: %w", err)
 			}
 
 			// Determine target SKI
@@ -314,25 +280,16 @@ certificate, or using the --id SKI to give its full hex Subject Key ID.`,
 			}
 
 			// Remove certificates matching the SKI
-			var newBundle strings.Builder
-			var removed bool
-			for _, cert := range existingCerts {
-				ski := utils.GetSubjectKeyID(cert)
-				if ski == targetSKI {
-					fmt.Printf("Removing certificate %s (SKI: %s) from trust bundle\n", cert.Subject.CommonName, ski)
-					removed = true
-					continue
-				}
-				// Keep this certificate
-				newBundle.WriteString(string(pkgtls.EncodeCertificatesPEM(cert)))
-			}
+			err = existingBundle.Remove(targetSKI)
 
-			if !removed {
-				return fmt.Errorf("certificate with Subject Key ID %s not found in trust bundle", targetSKI)
+			if err != nil {
+				// This can only happen if the certificate isn't in the bundle.
+				return err
 			}
 
 			// Update the ConfigMap
-			configMap.Data[utils.TrustRootsDataKey] = newBundle.String()
+			configMap.Data[utils.TrustRootsDataKey] = existingBundle.PEM()
+
 			_, err = k8sAPI.CoreV1().ConfigMaps(controlPlaneNamespace).Update(ctx, configMap, metav1.UpdateOptions{})
 			if err != nil {
 				return fmt.Errorf("failed to update ConfigMap: %w", err)
@@ -396,11 +353,6 @@ certificate appears or the timeout expires.`,
 				return fmt.Errorf("cannot specify more than one of: certificate file, --id flag, or --secret flag")
 			}
 
-			k8sAPI, err := k8s.NewAPI(kubeconfigPath, kubeContext, impersonate, impersonateGroup, 0)
-			if err != nil {
-				return err
-			}
-
 			// Parse timeout
 			timeout, err := time.ParseDuration(timeoutDuration)
 			if err != nil {
@@ -410,6 +362,12 @@ certificate appears or the timeout expires.`,
 			ctx := cmd.Context()
 
 			// Determine target SKI
+
+			k8sAPI, err := k8s.NewAPI(kubeconfigPath, kubeContext, impersonate, impersonateGroup, 0)
+			if err != nil {
+				return err
+			}
+
 			var targetSKI string
 			if skiFlag != "" {
 				// Use the provided SKI
@@ -419,30 +377,30 @@ certificate appears or the timeout expires.`,
 				if secretNamespace == "" {
 					secretNamespace = controlPlaneNamespace
 				}
-				cert, err := utils.GetCertFromSecret(ctx, k8sAPI, secretNamespace, secretName)
+
+				secret, err := k8sAPI.CoreV1().Secrets(secretNamespace).Get(ctx, secretName, metav1.GetOptions{})
+
 				if err != nil {
-					return fmt.Errorf("failed to get certificate from Secret %s/%s: %w", secretNamespace, secretName, err)
+					return fmt.Errorf("could not read Secret %s/%s: %w", secretNamespace, secretName, err)
 				}
-				targetSKI = utils.GetSubjectKeyID(cert)
-				fmt.Printf("Loaded certificate %s from Secret %s/%s\n", cert.Subject.CommonName, secretNamespace, secretName)
+
+				certAndKey, err := ourx509.NewCertAndKeyFromSecret(secret, "", "")
+
+				if err != nil {
+					return fmt.Errorf("could not load certificate from Secret %s/%s: %w", secretNamespace, secretName, err)
+				}
+
+				targetSKI = utils.GetSubjectKeyID(certAndKey.Certificate)
+				fmt.Printf("Loaded certificate %s from Secret %s/%s\n", certAndKey.Certificate.Subject.CommonName, secretNamespace, secretName)
 			} else {
 				// Read from file
-				certFile := args[0]
-				certData, err := os.ReadFile(certFile)
+				certAndKey, err := ourx509.NewCertAndKeyFromFiles(args[0], "")
+
 				if err != nil {
-					return fmt.Errorf("failed to read certificate file: %w", err)
+					return fmt.Errorf("could not load certificate from file %s: %w", args[0], err)
 				}
 
-				certs, err := pkgtls.DecodePEMCertificates(string(certData))
-				if err != nil {
-					return fmt.Errorf("failed to parse certificate: %w", err)
-				}
-
-				if len(certs) == 0 {
-					return fmt.Errorf("no valid certificates found in %s", certFile)
-				}
-
-				targetSKI = utils.GetSubjectKeyID(certs[0])
+				targetSKI = utils.GetSubjectKeyID(certAndKey.Certificate)
 			}
 
 			fmt.Printf("Waiting for certificate with SKI %s to appear in trust bundle...\n", targetSKI)
@@ -467,27 +425,19 @@ certificate appears or the timeout expires.`,
 						continue
 					}
 
-					// Get trust bundle
-					existingBundle := configMap.Data[utils.TrustRootsDataKey]
-					if existingBundle == "" {
-						// Bundle is empty, keep waiting
-						continue
-					}
+					// Load trust bundle
+					existingBundle, err := ourx509.NewBundleFromConfigMap(configMap, "")
 
-					existingCerts, err := pkgtls.DecodePEMCertificates(existingBundle)
 					if err != nil {
 						// Bundle is malformed, keep waiting
 						continue
 					}
 
 					// Check if target certificate is present
-					for _, cert := range existingCerts {
-						ski := utils.GetSubjectKeyID(cert)
-						if ski == targetSKI {
-							elapsed := time.Since(startTime)
-							fmt.Printf("Certificate %s (SKI: %s) found in trust bundle after %v\n", cert.Subject.CommonName, ski, elapsed.Round(time.Millisecond))
-							return nil
-						}
+					if existingBundle.ContainsSKI(targetSKI) {
+						elapsed := time.Since(startTime)
+						fmt.Printf("✓ Certificate with SKI %s found in trust bundle after %s\n", targetSKI, elapsed)
+						return nil
 					}
 				}
 			}
@@ -752,39 +702,38 @@ func showTrustBundle(ctx context.Context, options *trustBundleOptions) error {
 		return err
 	}
 
-	// If --pem flag is set, output raw PEM
-	if options.outputPEM {
-		configMap, err := k8sAPI.CoreV1().ConfigMaps(controlPlaneNamespace).Get(ctx, options.configMapName, metav1.GetOptions{})
-		if err != nil {
-			return fmt.Errorf("failed to get ConfigMap %s/%s: %w", controlPlaneNamespace, options.configMapName, err)
-		}
-		trustBundle := configMap.Data[utils.TrustRootsDataKey]
-		if trustBundle == "" {
-			return fmt.Errorf("trust bundle data key %s is empty in ConfigMap", utils.TrustRootsDataKey)
-		}
-		fmt.Print(trustBundle)
-		return nil
+	configMap, err := k8sAPI.CoreV1().ConfigMaps(controlPlaneNamespace).Get(ctx, options.configMapName, metav1.GetOptions{})
+
+	if err != nil {
+		return fmt.Errorf("failed to get ConfigMap %s/%s: %w", controlPlaneNamespace, options.configMapName, err)
 	}
 
-	// Get trust bundle certificates
-	certs, err := utils.GetTrustBundleCerts(ctx, k8sAPI, controlPlaneNamespace, options.configMapName)
+	// Load the trust bundle.
+	bundle, err := ourx509.NewBundleFromConfigMap(configMap, "")
+
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to load trust bundle: %w", err)
+	}
+
+	// If --pem flag is set, output raw PEM
+	if options.outputPEM {
+		fmt.Print(bundle.PEM())
+		return nil
 	}
 
 	// If --ski flag is set, output only Subject Key IDs
 	if options.outputIDs {
-		for _, cert := range certs {
+		for _, cert := range bundle.Certificates() {
 			fmt.Println(utils.GetSubjectKeyID(cert))
 		}
 		return nil
 	}
 
 	if options.verbose {
-		return showTrustBundleVerbose(certs, options.configMapName)
+		return showTrustBundleVerbose(bundle.Certificates(), options.configMapName)
 	}
 
-	return showTrustBundleDefault(certs, options.configMapName)
+	return showTrustBundleDefault(bundle.Certificates(), options.configMapName)
 }
 
 func showTrustBundleDefault(certs []*x509.Certificate, configMapName string) error {
