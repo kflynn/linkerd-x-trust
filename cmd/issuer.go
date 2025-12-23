@@ -1,17 +1,11 @@
 package main
 
 import (
-	"crypto/ecdsa"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"fmt"
-	"math/big"
 	"os"
 	"time"
 
-	"github.com/linkerd/linkerd-trust/v2/pkg/utils"
-	pkgtls "github.com/linkerd/linkerd2/pkg/tls"
+	ourx509 "github.com/linkerd/linkerd-trust/v2/pkg/x509"
 	"github.com/spf13/cobra"
 )
 
@@ -71,7 +65,7 @@ This creates a Linkerd identity issuer certificate.`,
 			}
 
 			// Load anchor cert and key
-			anchorCred, _, _, err := utils.LoadCertAndKeyFromPaths(anchorCertFile, anchorKeyFile)
+			anchor, err := ourx509.NewCertAndKeyFromFiles(anchorCertFile, anchorKeyFile)
 
 			if err != nil {
 				return fmt.Errorf("failed to load trust anchor: %w", err)
@@ -80,39 +74,27 @@ This creates a Linkerd identity issuer certificate.`,
 			// Generate trust issuer
 			fmt.Printf("Generating trust issuer certificate for %s...\n", identity)
 
-			cert, key, err := generateIssuer(anchorCred, identity, validity, pathlen)
+			issuer, err := ourx509.GenerateIssuer(anchor, identity, validity, pathlen)
 
 			if err != nil {
 				return fmt.Errorf("failed to generate issuer: %w", err)
 			}
 
 			// Write certificate
-			certPEM := pkgtls.EncodeCertificatesPEM(cert)
-
-			if err := os.WriteFile(certFile, []byte(certPEM), 0644); err != nil {
-				return fmt.Errorf("failed to write certificate file: %w", err)
-			}
-
-			// Write private key
-			keyPEM, err := pkgtls.EncodePrivateKeyPEM(key)
+			err = issuer.WriteToFiles(certFile, keyFile)
 
 			if err != nil {
-				return fmt.Errorf("failed to encode private key: %w", err)
-			}
-
-			err = os.WriteFile(keyFile, []byte(keyPEM), 0600)
-
-			if err != nil {
-				return fmt.Errorf("failed to write key file: %w", err)
+				return fmt.Errorf("failed to write certificate and key to files: %w", err)
 			}
 
 			fmt.Printf("✓ Identity issuer certificate written to %s\n", certFile)
 			fmt.Printf("✓ Private key written to %s\n", keyFile)
-			fmt.Printf("  Subject: %s\n", cert.Subject.CommonName)
-			fmt.Printf("  Subject Key ID: %s\n", utils.GetSubjectKeyID(cert))
-			fmt.Printf("  Valid: %s to %s\n",
-				cert.NotBefore.Format("2006-01-02 15:04:05"),
-				cert.NotAfter.Format("2006-01-02 15:04:05"))
+			fmt.Printf("  Subject: %s\n", issuer.SubjectName())
+			fmt.Printf("  Subject Key ID: %s\n", issuer.SubjectKeyID())
+
+			notBefore, notAfter := issuer.ValidityPeriod()
+
+			fmt.Printf("  Valid: %s to %s\n", notBefore, notAfter)
 
 			return nil
 		},
@@ -124,50 +106,4 @@ This creates a Linkerd identity issuer certificate.`,
 	cmd.Flags().IntVar(&pathlen, "pathlen", 0, "Maximum path length for intermediate CAs (0 means no intermediates allowed)")
 
 	return cmd
-}
-
-func generateIssuer(anchorCred *pkgtls.Cred, identity string, validity time.Duration, pathlen int) (*x509.Certificate, *ecdsa.PrivateKey, error) {
-	// Generate private key
-	key, err := pkgtls.GenerateKey()
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to generate private key: %w", err)
-	}
-
-	// Generate serial number
-	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to generate serial number: %w", err)
-	}
-
-	now := time.Now()
-	notBefore := now.Add(-1 * time.Hour) // backdated by 1 hour for clock skew
-	notAfter := now.Add(validity)
-
-	// Create certificate template
-	template := &x509.Certificate{
-		SerialNumber: serialNumber,
-		Subject: pkix.Name{
-			CommonName: identity,
-		},
-		NotBefore:             notBefore,
-		NotAfter:              notAfter,
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-		MaxPathLen:            pathlen,
-		MaxPathLenZero:        pathlen == 0,
-	}
-
-	// Sign the identity issuer certificate with the anchor CA
-	certDER, err := x509.CreateCertificate(rand.Reader, template, anchorCred.Certificate, key.Public(), anchorCred.PrivateKey)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create certificate: %w", err)
-	}
-
-	cert, err := x509.ParseCertificate(certDER)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse generated certificate: %w", err)
-	}
-
-	return cert, key, nil
 }

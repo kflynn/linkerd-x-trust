@@ -3,7 +3,9 @@ package x509
 import (
 	"crypto/ecdsa"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"os"
@@ -19,6 +21,59 @@ type PrivateKey interface{}
 type CertAndKey struct {
 	Certificate *x509.Certificate
 	PrivateKey  PrivateKey // *rsa.PrivateKey, *ecdsa.PrivateKey, or nil
+}
+
+func (ck *CertAndKey) CommonName() string {
+	if ck.Certificate != nil {
+		return ck.Certificate.Subject.CommonName
+	}
+
+	return ""
+}
+
+func (ck *CertAndKey) SubjectName() string {
+	if ck.Certificate != nil {
+		return ck.Certificate.Subject.String()
+	}
+
+	return ""
+}
+
+func (ck *CertAndKey) SubjectKeyID() string {
+	if ck.Certificate != nil {
+		ski := ck.Certificate.SubjectKeyId
+
+		if ski != nil {
+			return hex.EncodeToString(ski)
+		}
+
+		// Calculate SKI using SHA-1 hash of the public key
+		hash := sha1.Sum(ck.Certificate.RawSubjectPublicKeyInfo)
+		return hex.EncodeToString(hash[:])
+	}
+
+	return ""
+}
+
+func (ck *CertAndKey) AuthorityKeyId() string {
+	if ck.Certificate != nil {
+		aki := ck.Certificate.AuthorityKeyId
+
+		if aki != nil {
+			return hex.EncodeToString(aki)
+		}
+	}
+
+	return "none"
+}
+
+func (ck *CertAndKey) ValidityPeriod() (notBefore, notAfter string) {
+	if ck.Certificate != nil {
+		notBefore = ck.Certificate.NotBefore.Format("2006-01-02 15:04:05")
+		notAfter = ck.Certificate.NotAfter.Format("2006-01-02 15:04:05")
+	}
+
+	return notBefore, notAfter
 }
 
 // NewCertAndKey creates a new CertAndKey with the given certificate and optional private key.
