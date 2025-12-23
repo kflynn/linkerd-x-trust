@@ -1,0 +1,124 @@
+YOU MUST REVIEW THIS FILE BEFORE APPLYING IT TO YOUR CLUSTER. At
+minimum, you'll need to remove these lines, but you really need to
+review _everything_ and modify as needed for your organization's
+needs.
+
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  # This is the cert-manager Issuer used for the Linkerd trust anchor. It
+  # describes how cert-manager should create the trust anchor
+  # certificate.
+  #
+  # THIS IS A SELF-SIGNED ISSUER. You will very likely need to edit this
+  # to match your organization's needs.
+  name: linkerd-trust-root-issuer
+  namespace: cert-manager
+spec:
+  selfSigned: {}
+
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  # This is the cert-manager Certificate for the Linkerd trust anchor. It
+  # describes the trust anchor certificate that cert-manager should
+  # issue.
+  #
+  # It relies on the linkerd-trust-root-issuer above.
+  name: linkerd-trust-anchor
+  # This namespace is important: the certificate issued will be saved in
+  # a Secret in this namespace. We're using the cert-manager namespace
+  # here because only cert-manager should have access to the trust
+  # anchor's private key.
+  namespace: cert-manager
+spec:
+  # This tells cert-manager which issuer to use for this Certificate: in
+  # this case, the Issuer named linkerd-trust-root-issuer.
+  issuerRef:
+    kind: Issuer
+    name: linkerd-trust-root-issuer
+
+  # The issued certificate will be saved in this Secret _in the same
+  # namespace as this Certificate resource_. For the trust anchor, this
+  # should NOT be the linkerd namespace, because only cert-manager should
+  # have access to the trust anchor's private key.
+  secretName: linkerd-trust-anchor
+
+  # These are details about the certificate to be issued: check
+  # out the cert-manager docs for more, but realize that setting
+  # the private key's rotationPolicy to Always is _very_ important,
+  # and that for Linkerd you _must_ set isCA to true!
+  isCA: true
+  commonName: root.linkerd.cluster.local
+
+  # This is a six-month duration, rotating two months before expiry. Feel
+  # free to reduce this, but remember that rotating the trust anchor does
+  # currently require human intervention.
+  duration: 4380h0m0s
+  renewBefore: 1460h0m0s
+  privateKey:
+    rotationPolicy: Always
+    algorithm: ECDSA
+
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  # This is the cert-manager ClusterIssuer used for the Linkerd identity
+  # issuer. It describes how cert-manager should create the identity
+  # issuer certificate.
+  #
+  # It's a ClusterIssuer because the identity issuer certificate MUST be
+  # created in the linkerd namespace, and a ClusterIssuer is the way to
+  # allow crossing namespaces with cert-manager.
+  #
+  # As written, this ClusterIssuer uses the linkerd-trust-anchor Secret
+  # created by the linkerd-trust-anchor Certificate above as its CA. You
+  # may need to edit this to match your organization's needs.
+  name: linkerd-identity-issuer
+  namespace: cert-manager
+spec:
+  ca:
+    secretName: linkerd-trust-anchor
+
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  # This is the cert-manager Certificate for the Linkerd identity issuer.
+  # It describes the identity issuer certificate that cert-manager should
+  # issue.
+  #
+  # It relies on the linkerd-identity-issuer ClusterIssuer above.
+  name: linkerd-identity-issuer
+  namespace: linkerd
+spec:
+  # This tells cert-manager which issuer to use for this Certificate:
+  # in this case, the ClusterIssuer named linkerd-identity-issuer.
+  issuerRef:
+    name: linkerd-identity-issuer
+    kind: ClusterIssuer
+
+  # The issued certificate will be saved in this Secret _in the same
+  # namespace as this Certificate resource_. For the identity issuer,
+  # this MUST be the linkerd namespace, because Linkerd requires access
+  # to the trust anchor's private key.
+  secretName: linkerd-identity-issuer
+
+  # These are details about the certificate to be issued: check
+  # out the cert-manager docs for more, but realize that setting
+  # the private key's rotationPolicy to Always is _very_ important,
+  # and that for Linkerd you _must_ set isCA to true!
+  isCA: true
+  commonName: identity.linkerd.cluster.local
+
+  # This is a two-week duration, rotating three days before
+  # expiry. Feel free to set this as you like.
+  duration: 336h0m0s
+  renewBefore: 72h0m0s
+  privateKey:
+    rotationPolicy: Always
+    algorithm: ECDSA
+

@@ -81,6 +81,7 @@ func main() {
 	// parser.AddCommand(newCmdUninstall())
 	parser.AddCommand(newCmdVersion())
 	parser.AddCommand(newCmdLicense())
+	parser.AddCommand(newCmdCertManager())
 	// parser.AddCommand(newCmdCheck())
 
 	// resource-aware completion flag configurations
