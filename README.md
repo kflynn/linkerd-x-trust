@@ -26,6 +26,55 @@ linkerd x-trust chain
 
 to get an overview of what your trust hierarchy looks like.
 
+## Bootstrapping a Cluster
+
+Another example: bootstrapping a completely empty cluster from the CLI:
+
+First, generate a trust anchor and an identity issuer.
+
+```bash
+rm -rf certs
+mkdir certs
+
+linkerd x-trust anchor generate \
+  certs/anchor.{crt,key}
+
+linkerd x-trust issuer generate \
+  certs/anchor.{crt,key} \
+  certs/issuer.{crt,key}
+```
+
+Next, use these to bootstrap the trust hierarchy that Linkerd will use.
+
+```bash
+linkerd x-trust bundle add --create certs/anchor.crt
+linkerd x-trust identity update --create certs/issuer.{crt,key}
+```
+
+Finally, install Linkerd with the external CA option. (Obviously you
+could use Helm for this just as easily.)
+
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.3.0/standard-install.yaml
+
+linkerd install --crds | kubectl apply -f -
+
+linkerd install \
+  --set identity.issuer.scheme=kubernetes.io/tls \
+  --set identity.externalCA=true \
+    | kubectl apply -f -
+```
+
+At this point Linkerd should be up and running:
+
+```bash
+linkerd check
+```
+
+**NOTE:** As a guard against trying to use this in production, by default
+`linkerd x-trust` will generate a 30-day trust anchor and a 14-day
+identity issuer.
+
 ## Linkerd Extensions
 
 The [Linkerd service mesh](https://linkerd.io) includes a simple but
