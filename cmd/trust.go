@@ -99,6 +99,8 @@ func newCmdTrustBundleShow() *cobra.Command {
 
 func newCmdTrustBundleAdd() *cobra.Command {
 	options := newTrustBundleOptions()
+	var secretName string
+	var secretNamespace string
 
 	cmd := &cobra.Command{
 		Use:   "add <cert-file>",
@@ -116,22 +118,62 @@ exist.`,
   linkerd trust bundle add ca.crt --configmap my-trust-roots -L my-namespace
 
   # Create the ConfigMap if it doesn't exist
-  linkerd trust bundle add ca.crt --create`,
-		Args:         cobra.ExactArgs(1),
+  linkerd trust bundle add ca.crt --create
+
+  # Add the a certificate from a Secret
+  linkerd trust bundle add --secret linkerd-trust-anchor -n cert-manager`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			certFile := args[0]
+			specifiedCount := 0
+			if len(args) > 0 {
+				specifiedCount++
+			}
+			if secretName != "" {
+				specifiedCount++
+			}
+			if specifiedCount == 0 {
+				return fmt.Errorf("must specify either a certificate file or --secret flag")
+			}
+			if specifiedCount > 1 {
+				return fmt.Errorf("cannot specify more than one of: certificate file or --secret flag")
+			}
 
 			k8sAPI, err := k8s.NewAPI(kubeconfigPath, kubeContext, impersonate, impersonateGroup, 0)
 			if err != nil {
 				return err
 			}
 
-			// Load the new certificates as a bundle.
-			newCertBundle, err := ourx509.NewBundleFromFile(certFile)
+			newCertBundle := ourx509.NewBundle()
 
-			if err != nil {
-				return fmt.Errorf("could not load certificates from %s: %w", certFile, err)
+			// Load the new certificates as a bundle.
+			if secretName != "" {
+				// Read from Secret
+				if secretNamespace == "" {
+					secretNamespace = controlPlaneNamespace
+				}
+
+				secret, err := k8sAPI.CoreV1().Secrets(secretNamespace).Get(cmd.Context(), secretName, metav1.GetOptions{})
+
+				if err != nil {
+					return fmt.Errorf("could not read Secret %s/%s: %w", secretNamespace, secretName, err)
+				}
+
+				certAndKey, err := ourx509.NewCertAndKeyFromSecret(secret, "", "")
+
+				if err != nil {
+					return fmt.Errorf("could not load certificate from Secret %s/%s: %w", secretNamespace, secretName, err)
+				}
+
+				// Add the cert from the Secret to our new-certificates bundle.
+				newCertBundle.Add(certAndKey.Certificate)
+			} else {
+				certFile := args[0]
+
+				err = newCertBundle.LoadFromFile(certFile)
+
+				if err != nil {
+					return fmt.Errorf("could not load certificates from %s: %w", certFile, err)
+				}
 			}
 
 			// Set up to load our existing trust bundle.
@@ -160,7 +202,7 @@ exist.`,
 				fmt.Printf("Creating ConfigMap %s/%s\n", controlPlaneNamespace, options.configMapName)
 			} else {
 				// ConfigMap exists, get existing trust bundle
-				existingBundle.LoadFromConfigMap(configMap, "")
+				err = existingBundle.LoadFromConfigMap(configMap, "")
 
 				if err != nil {
 					return fmt.Errorf("could not load existing trust bundle: %w", err)
@@ -200,6 +242,8 @@ exist.`,
 
 	cmd.Flags().StringVar(&options.configMapName, "configmap", utils.TrustRootsConfigMapName, "Name of the trust roots ConfigMap")
 	cmd.Flags().BoolVar(&options.create, "create", false, "Create the ConfigMap if it doesn't exist")
+	cmd.Flags().StringVar(&secretName, "secret", "", "Name of the Secret containing the certificate to wait for")
+	cmd.Flags().StringVarP(&secretNamespace, "secret-namespace", "n", "", "Namespace of the Secret (defaults to control plane namespace)")
 
 	return cmd
 }
