@@ -42,7 +42,10 @@ When run without subcommands, displays the identity issuer certificate.`,
   linkerd trust identity
 
   # Update the identity issuer
-  linkerd trust identity update issuer.crt issuer.key`,
+  linkerd trust identity update issuer.crt issuer.key
+
+  # Update with a federated issuer chain
+  linkerd trust identity update issuer.crt cluster-anchor.crt issuer.key`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return showIdentityIssuer(cmd.Context(), options)
@@ -91,26 +94,57 @@ func newCmdTrustIdentityUpdate() *cobra.Command {
 	var secretName string
 
 	cmd := &cobra.Command{
-		Use:   "update <cert-file> <key-file>",
+		Use:   "update <cert-file> [<intermediate-cert-file> ...] <key-file>",
 		Short: "Update the identity issuer certificate and key",
 		Long: `Update the identity issuer certificate and key in the linkerd-identity-issuer Secret.
 
-The certificate and key must be provided as PEM files. The command validates that:
-1. The certificate and key match
-2. The certificate is signed by a certificate in the trust bundle`,
+The last argument is the key file; every earlier argument is a certificate
+file. Each certificate file may hold a single certificate or a multi-
+certificate bundle, in any order. The key file selects the certificate to
+install: it must match exactly one of the certificates (for a federated
+issuer, the identity issuer itself). That certificate's issuers must form a
+chain, each signed by the one above it, anchored by the trust bundle.
+
+Additional certificates beyond the leaf's chain are allowed, as long as each
+one is signed by another given certificate or by a certificate in the trust
+bundle: during issuer rotation, both the current and the next generation's
+certificates need to be present until the control plane can be restarted.
+Only the selected certificate's chain is written to the Secret.
+
+The command validates that:
+1. The key matches exactly one of the certificates (the one to install)
+2. That certificate's issuer chain is anchored by the trust bundle
+3. Every other certificate is signed by another given certificate or by
+   a certificate in the trust bundle (so rotation material may be present)`,
 		Example: `  # Update the identity issuer
   linkerd trust identity update issuer.crt issuer.key
 
+  # Update with a federated issuer chain (issuer + cluster anchor)
+  linkerd trust identity update issuer.crt cluster-anchor.crt issuer.key
+
+  # Rotation: both generations present; the key picks the issuer to install
+  linkerd trust identity update id1.crt anchor1.crt id2.crt anchor2.crt id1.key
+
   # Update in a custom namespace
-  linkerd trust identity update issuer.crt issuer.key -L my-namespace
+  linkerd trust identity update issuer.crt cluster-anchor.crt issuer.key -L my-namespace
 
   # Create the Secret if it doesn't exist
-  linkerd trust identity update issuer.crt issuer.key --create`,
-		Args:         cobra.ExactArgs(2),
+  linkerd trust identity update --create issuer.crt cluster-anchor.crt issuer.key`,
+		Args:         cobra.MinimumNArgs(2),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			certFile := args[0]
-			keyFile := args[1]
+			certFiles := args[:len(args)-1]
+			keyFile := args[len(args)-1]
+
+			// Load the certificate files and the key file. The leaf
+			// certificate is the one matching the key; the rest of the
+			// certificates are ordered into an issuer chain above it.
+			// This happens before any cluster interaction, so local
+			// errors are reported without needing cluster access.
+			cred, certData, keyData, allCerts, err := utils.LoadIssuerChainFromPaths(certFiles, keyFile)
+			if err != nil {
+				return fmt.Errorf("failed to load certificate and key: %w", err)
+			}
 
 			k8sAPI, err := k8s.NewAPI(kubeconfigPath, kubeContext, impersonate, impersonateGroup, 0)
 			if err != nil {
@@ -119,15 +153,16 @@ The certificate and key must be provided as PEM files. The command validates tha
 
 			ctx := cmd.Context()
 
-			// Load certificate and key files
-			cred, certData, keyData, err := utils.LoadCertAndKeyFromPaths(certFile, keyFile)
-
-			if err != nil {
-				return fmt.Errorf("failed to load certificate and key: %w", err)
-			}
-
 			// Get the issuer certificate
 			issuerCert := cred.Certificate
+
+			// Build the leaf-to-root chain from the loaded credentials.
+			// (Cred.TrustChain is stored root at the head, so reverse it.)
+			chainCerts := make([]*x509.Certificate, 0, len(cred.TrustChain)+1)
+			chainCerts = append(chainCerts, cred.Certificate)
+			for i := len(cred.TrustChain) - 1; i >= 0; i-- {
+				chainCerts = append(chainCerts, cred.TrustChain[i])
+			}
 
 			// Get trust bundle
 			trustBundleCerts, err := utils.GetTrustBundleCerts(ctx, k8sAPI, controlPlaneNamespace, utils.TrustRootsConfigMapName)
@@ -135,22 +170,25 @@ The certificate and key must be provided as PEM files. The command validates tha
 				return err
 			}
 
-			// Verify the certificate is signed by a trust anchor
-			signed := false
-			var signingCert *x509.Certificate
-			for _, trustCert := range trustBundleCerts {
-				if utils.VerifyCertSignedBy(issuerCert, trustCert) {
-					signed = true
-					signingCert = trustCert
-					break
-				}
+			// Verify the certificate chain is anchored by a trust anchor
+			signingCert, err := utils.VerifyChainAnchored(chainCerts, trustBundleCerts)
+			if err != nil {
+				return fmt.Errorf("%w (for a federated issuer, provide the issuer certificate and the intermediate certificates above it, e.g. 'identity update issuer.crt cluster-anchor.crt issuer.key')", err)
 			}
 
-			if !signed {
-				return fmt.Errorf("certificate is not signed by any certificate in the trust bundle")
+			// Rotation: certificates beyond the leaf's chain (the next
+			// generation's issuer and anchor) may be given, as long as each
+			// one is signed by another given certificate or by a trust
+			// bundle certificate.
+			if err := utils.ValidateRotationCerts(allCerts, trustBundleCerts); err != nil {
+				return err
 			}
 
-			fmt.Printf("✓ Certificate is signed by trust anchor: %s\n", signingCert.Subject.CommonName)
+			if len(chainCerts) > 1 {
+				fmt.Printf("✓ Certificate chain (%d intermediate(s)) is anchored by trust anchor: %s\n", len(chainCerts)-1, signingCert.Subject.CommonName)
+			} else {
+				fmt.Printf("✓ Certificate is signed by trust anchor: %s\n", signingCert.Subject.CommonName)
+			}
 
 			// Get or create the Secret
 			secret, err := k8sAPI.CoreV1().Secrets(controlPlaneNamespace).Get(ctx, secretName, metav1.GetOptions{})
@@ -249,11 +287,13 @@ func showIdentityIssuer(ctx context.Context, options *trustIdentityOptions) erro
 		return nil
 	}
 
-	// Get identity issuer certificate
-	cert, err := utils.GetCertFromSecret(ctx, k8sAPI, controlPlaneNamespace, options.secretName)
+	// Get identity issuer certificate(s). For a federated issuer the Secret
+	// holds a bundle: the issuer certificate followed by intermediates.
+	certs, err := utils.GetCertsFromSecret(ctx, k8sAPI, controlPlaneNamespace, options.secretName)
 	if err != nil {
 		return err
 	}
+	cert := certs[0]
 
 	// If --ids flag is set, output only Subject Key ID
 	if options.outputIDs {
@@ -262,13 +302,15 @@ func showIdentityIssuer(ctx context.Context, options *trustIdentityOptions) erro
 	}
 
 	if options.verbose {
-		return showIdentityIssuerVerbose(cert, options.secretName)
+		return showIdentityIssuerVerbose(certs, options.secretName)
 	}
 
-	return showIdentityIssuerDefault(cert, options.secretName)
+	return showIdentityIssuerDefault(certs, options.secretName)
 }
 
-func showIdentityIssuerDefault(cert *x509.Certificate, secretName string) error {
+func showIdentityIssuerDefault(certs []*x509.Certificate, secretName string) error {
+	cert := certs[0]
+
 	// Display certificate
 	fmt.Printf("Identity Issuer Certificate (%s/%s)\n", controlPlaneNamespace, secretName)
 	fmt.Println("==========================================")
@@ -284,21 +326,36 @@ func showIdentityIssuerDefault(cert *x509.Certificate, secretName string) error 
 	if cert.IsCA {
 		fmt.Println("Is CA: true")
 	}
+	if len(certs) > 1 {
+		fmt.Printf("Bundle: %d certificates (issuer + %d intermediate(s))\n", len(certs), len(certs)-1)
+		for _, intermediate := range certs[1:] {
+			fmt.Printf("  Intermediate: %s (SKI: %s)\n", intermediate.Subject.CommonName, utils.GetSubjectKeyID(intermediate))
+		}
+	}
 
 	return nil
 }
 
-func showIdentityIssuerVerbose(cert *x509.Certificate, secretName string) error {
+func showIdentityIssuerVerbose(certs []*x509.Certificate, secretName string) error {
 	fmt.Printf("Identity Issuer Certificate (%s/%s)\n", controlPlaneNamespace, secretName)
 	fmt.Println("==========================================")
 	fmt.Println()
 
-	fmt.Printf("%s\n\n", cert.Subject.CommonName)
-	result, err := certinfo.CertificateText(cert)
-	if err != nil {
-		return fmt.Errorf("failed to format certificate: %w", err)
+	for i, cert := range certs {
+		if len(certs) > 1 {
+			fmt.Printf("[%d] %s\n\n", i+1, cert.Subject.CommonName)
+		} else {
+			fmt.Printf("%s\n\n", cert.Subject.CommonName)
+		}
+		result, err := certinfo.CertificateText(cert)
+		if err != nil {
+			return fmt.Errorf("failed to format certificate: %w", err)
+		}
+		fmt.Print(result)
+		if i < len(certs)-1 {
+			fmt.Println()
+		}
 	}
-	fmt.Print(result)
 
 	return nil
 }

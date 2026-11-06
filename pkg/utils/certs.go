@@ -1,12 +1,16 @@
 package utils
 
 import (
+	"bytes"
 	"context"
+	"crypto"
 	"crypto/sha1"
 	"crypto/x509"
 	"encoding/hex"
+	"encoding/pem"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/linkerd/linkerd2/pkg/k8s"
 	pkgtls "github.com/linkerd/linkerd2/pkg/tls"
@@ -76,6 +80,203 @@ func LoadCertAndKeyFromPaths(certPath, keyPath string) (*pkgtls.Cred, string, st
 	return cred, string(certData), string(keyData), nil
 }
 
+// LoadIssuerChainFromPaths loads an identity issuer chain from one or more
+// certificate files plus a single key file. The certificate files may each
+// hold a single certificate or a multi-certificate bundle, in any order: the
+// leaf certificate is the one whose public key matches the key file, and its
+// issuers are ordered into a chain by verifying signatures.
+//
+// Certificates outside the leaf's chain are not an error here: during issuer
+// rotation, both the current and the next generation's certificates must be
+// present until the control plane can be restarted. They are returned as
+// allCerts so the caller can validate them against the trust bundle (see
+// ValidateRotationCerts).
+//
+// It returns the leaf's credentials, the leaf-first chain as canonical PEM
+// (this is what gets written to the Secret), the key PEM, and every
+// certificate that was given.
+func LoadIssuerChainFromPaths(certPaths []string, keyPath string) (*pkgtls.Cred, string, string, []*x509.Certificate, error) {
+	if len(certPaths) == 0 {
+		return nil, "", "", nil, fmt.Errorf("at least one certificate file is required")
+	}
+	for _, certPath := range certPaths {
+		if strings.HasSuffix(certPath, ".key") {
+			return nil, "", "", nil, fmt.Errorf("%s: only one key file may be given, as the last argument", certPath)
+		}
+	}
+
+	keyData, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, "", "", nil, fmt.Errorf("failed to read key file: %w", err)
+	}
+	privateKey, err := parsePrivateKeyPEM(string(keyData))
+	if err != nil {
+		return nil, "", "", nil, fmt.Errorf("failed to parse key file %s: %w", keyPath, err)
+	}
+
+	// Load all certificates from all files.
+	var certs []*x509.Certificate
+	for _, certPath := range certPaths {
+		fileCerts, err := LoadCertsFromFile(certPath)
+		if err != nil {
+			return nil, "", "", nil, err
+		}
+		certs = append(certs, fileCerts...)
+	}
+
+	// The leaf certificate is the one matching the key.
+	var leaf *x509.Certificate
+	for _, cert := range certs {
+		if publicKeyMatches(cert, privateKey) {
+			if leaf != nil {
+				return nil, "", "", nil, fmt.Errorf("the key matches more than one certificate (%s and %s)", leaf.Subject.CommonName, cert.Subject.CommonName)
+			}
+			leaf = cert
+		}
+	}
+	if leaf == nil {
+		return nil, "", "", nil, fmt.Errorf("the key in %s does not match any of the given certificates (the key must go with the leaf certificate)", keyPath)
+	}
+
+	chain := AssembleIssuerChain(leaf, certs)
+
+	var chainPEM strings.Builder
+	for _, cert := range chain {
+		chainPEM.WriteString(pkgtls.EncodeCertificatesPEM(cert))
+	}
+	certData := chainPEM.String()
+
+	cred, err := pkgtls.ValidateAndCreateCreds(certData, string(keyData))
+	if err != nil {
+		return nil, "", "", nil, fmt.Errorf("failed to validate certificate and key: %w", err)
+	}
+
+	return cred, certData, string(keyData), certs, nil
+}
+
+// parsePrivateKeyPEM parses an EC, RSA, or PKCS#8 private key from PEM.
+func parsePrivateKeyPEM(pemData string) (crypto.PrivateKey, error) {
+	block, _ := pem.Decode([]byte(pemData))
+	if block == nil {
+		return nil, fmt.Errorf("no PEM data found")
+	}
+	switch block.Type {
+	case "EC PRIVATE KEY":
+		return x509.ParseECPrivateKey(block.Bytes)
+	case "RSA PRIVATE KEY":
+		return x509.ParsePKCS1PrivateKey(block.Bytes)
+	case "PRIVATE KEY":
+		return x509.ParsePKCS8PrivateKey(block.Bytes)
+	default:
+		return nil, fmt.Errorf("unsupported PEM block type %q (want EC PRIVATE KEY, RSA PRIVATE KEY, or PRIVATE KEY)", block.Type)
+	}
+}
+
+// publicKeyMatches reports whether the private key is the counterpart of the
+// certificate's public key.
+func publicKeyMatches(cert *x509.Certificate, privateKey crypto.PrivateKey) bool {
+	signer, ok := privateKey.(crypto.Signer)
+	if !ok {
+		return false
+	}
+	certPub, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+	if err != nil {
+		return false
+	}
+	keyPub, err := x509.MarshalPKIXPublicKey(signer.Public())
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(certPub, keyPub)
+}
+
+// CertIDsMatch is gone: identifier matching (issuer/subject DNs and key IDs)
+// is ambiguous during rotation, when an old and a replacement certificate
+// share a subject. Chain assembly verifies signatures instead.
+
+// AssembleIssuerChain orders certificates into a leaf-first issuer chain
+// starting at leaf, by verifying that each certificate is signed by the one
+// above it. The chain ends when no given certificate signs the current head
+// (the trust bundle takes over above that point). Certificates outside the
+// chain -- e.g. the next generation's material during rotation -- are simply
+// not included; the caller validates them with ValidateRotationCerts.
+// Duplicate certificates are collapsed.
+func AssembleIssuerChain(leaf *x509.Certificate, certs []*x509.Certificate) []*x509.Certificate {
+	chain := []*x509.Certificate{leaf}
+	inChain := map[string]bool{string(leaf.Raw): true}
+
+	for {
+		current := chain[len(chain)-1]
+
+		var next *x509.Certificate
+		for _, cert := range certs {
+			if inChain[string(cert.Raw)] {
+				continue
+			}
+			if VerifyCertSignedBy(current, cert) {
+				next = cert
+				break
+			}
+		}
+		if next == nil {
+			break
+		}
+		chain = append(chain, next)
+		inChain[string(next.Raw)] = true
+	}
+
+	return chain
+}
+
+// ValidateRotationCerts checks the invariant that lets `identity update`
+// accept a directory holding two generations of certificates: every given
+// certificate must be signed by another given certificate or by a
+// certificate in the trust bundle -- and following those links must
+// eventually reach the trust bundle. The single key file must belong with
+// one of the certificates (the leaf to install); that's checked at load
+// time.
+func ValidateRotationCerts(certs, trustBundle []*x509.Certificate) error {
+	for _, cert := range certs {
+		if err := certReachesTrustBundle(cert, certs, trustBundle); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// certReachesTrustBundle walks up from cert through the given certificates
+// by signature, and succeeds as soon as it reaches a certificate signed by
+// (or identical to) a trust bundle certificate.
+func certReachesTrustBundle(cert *x509.Certificate, certs, trustBundle []*x509.Certificate) error {
+	current := cert
+
+	// At most len(certs) upward hops are meaningful; more means a loop.
+	for step := 0; step <= len(certs); step++ {
+		for _, trustCert := range trustBundle {
+			if current.Equal(trustCert) || VerifyCertSignedBy(current, trustCert) {
+				return nil
+			}
+		}
+
+		var next *x509.Certificate
+		for _, c := range certs {
+			if bytes.Equal(c.Raw, current.Raw) {
+				continue
+			}
+			if VerifyCertSignedBy(current, c) {
+				next = c
+				break
+			}
+		}
+		if next == nil {
+			return fmt.Errorf("%s (SKI %s) is neither signed by another given certificate nor by a certificate in the trust bundle", current.Subject.CommonName, GetSubjectKeyID(current))
+		}
+		current = next
+	}
+
+	return fmt.Errorf("certificate loop detected while walking up from %s (SKI %s)", cert.Subject.CommonName, GetSubjectKeyID(cert))
+}
+
 func GetSubjectKeyID(cert *x509.Certificate) string {
 	if cert.SubjectKeyId != nil {
 		return hex.EncodeToString(cert.SubjectKeyId)
@@ -116,6 +317,20 @@ func GetTrustBundleCerts(ctx context.Context, k8sAPI *k8s.KubernetesAPI, namespa
 }
 
 func GetCertFromSecret(ctx context.Context, k8sAPI *k8s.KubernetesAPI, namespace string, secretName string) (*x509.Certificate, error) {
+	certs, err := GetCertsFromSecret(ctx, k8sAPI, namespace, secretName)
+	if err != nil {
+		return nil, err
+	}
+
+	return certs[0], nil
+}
+
+// GetCertsFromSecret reads all certificates from a Secret's certificate
+// data. For a classic identity issuer this is a single certificate; for a
+// federated identity issuer it is a bundle containing the issuer
+// certificate followed by one or more intermediate CA certificates, ordered
+// leaf to root.
+func GetCertsFromSecret(ctx context.Context, k8sAPI *k8s.KubernetesAPI, namespace string, secretName string) ([]*x509.Certificate, error) {
 	secret, err := k8sAPI.CoreV1().Secrets(namespace).Get(ctx, secretName, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get Secret %s/%s: %w", namespace, secretName, err)
@@ -140,7 +355,99 @@ func GetCertFromSecret(ctx context.Context, k8sAPI *k8s.KubernetesAPI, namespace
 		return nil, fmt.Errorf("no certificates found in identity issuer secret")
 	}
 
-	return certs[0], nil
+	return certs, nil
+}
+
+// FindIssuerChain takes the certificates from the identity issuer Secret
+// and a workload certificate, and returns the chain of issuer certificates
+// that links the issuer that signs the workload to the topmost certificate
+// reachable within the Secret's certificates.
+//
+// The returned chain is ordered from the workload-signing issuer (chain[0])
+// to the topmost certificate (chain[len(chain)-1]). The order of the input
+// certificates doesn't matter, so both leaf-first and root-first bundles
+// work. For a classic (non-federated) issuer Secret containing a single
+// certificate, the chain has exactly one element.
+func FindIssuerChain(workloadCert *x509.Certificate, issuerCerts []*x509.Certificate) ([]*x509.Certificate, error) {
+	if len(issuerCerts) == 0 {
+		return nil, fmt.Errorf("no certificates in identity issuer secret")
+	}
+
+	// Find the certificate that signs the workload: the identity issuer.
+	var chain []*x509.Certificate
+	for _, cert := range issuerCerts {
+		if VerifyCertSignedBy(workloadCert, cert) {
+			chain = []*x509.Certificate{cert}
+			break
+		}
+	}
+
+	if chain == nil {
+		return nil, fmt.Errorf("no certificate in the identity issuer Secret signs the workload certificate (SKI: %s)", GetSubjectKeyID(workloadCert))
+	}
+
+	// Walk upward from the issuer through the Secret's certificates until
+	// we reach a self-signed certificate or run out of issuers.
+	for len(chain) < len(issuerCerts) {
+		current := chain[len(chain)-1]
+
+		// A self-signed certificate is the top of the chain.
+		if current.CheckSignatureFrom(current) == nil {
+			break
+		}
+
+		found := false
+		for _, cert := range issuerCerts {
+			if cert.Equal(current) {
+				continue
+			}
+			if VerifyCertSignedBy(current, cert) {
+				chain = append(chain, cert)
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			// No certificate in the Secret signs the current one, so the
+			// chain ends here. The trust bundle is responsible for the rest.
+			break
+		}
+	}
+
+	return chain, nil
+}
+
+// VerifyChainAnchored verifies that a leaf-to-root certificate chain is
+// internally consistent (each certificate is signed by the one after it)
+// and that its topmost certificate is signed by a certificate in the trust
+// bundle. It returns the trust bundle certificate that anchors the chain.
+//
+// For a classic identity issuer the chain is a single certificate signed
+// directly by a trust anchor; for a federated issuer it is the issuer
+// certificate followed by one or more intermediate CA certificates, with
+// the trust bundle anchoring the topmost intermediate.
+func VerifyChainAnchored(chain, trustBundle []*x509.Certificate) (*x509.Certificate, error) {
+	if len(chain) == 0 {
+		return nil, fmt.Errorf("empty certificate chain")
+	}
+
+	// Each certificate must be signed by the one after it.
+	for i := 0; i < len(chain)-1; i++ {
+		if !VerifyCertSignedBy(chain[i], chain[i+1]) {
+			return nil, fmt.Errorf("certificate %s is not signed by %s", chain[i].Subject.CommonName, chain[i+1].Subject.CommonName)
+		}
+	}
+
+	// The topmost certificate must be signed by a trust bundle certificate.
+	top := chain[len(chain)-1]
+	for _, trustCert := range trustBundle {
+		if VerifyCertSignedBy(top, trustCert) {
+			return trustCert, nil
+		}
+	}
+
+	return nil, fmt.Errorf("no certificate in the trust bundle signs %s (the top of the certificate chain)", top.Subject.CommonName)
 }
 
 func VerifyCertSignedBy(cert, issuer *x509.Certificate) bool {

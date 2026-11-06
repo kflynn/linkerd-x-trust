@@ -521,7 +521,9 @@ func newCmdTrustChain() *cobra.Command {
 
 This command reads all certificates in the trust bundle, the identity issuer certificate,
 and a workload certificate, then displays their relationships as a tree diagram and verifies
-the chain of trust. By default, it uses the linkerd-identity controller. You can specify a
+the chain of trust. The identity issuer Secret may contain a bundle: the issuer certificate
+followed by the intermediate CA certificates above it (leaf to root), as used by federated
+trust anchors. By default, it uses the linkerd-identity controller. You can specify a
 pod name or use a label selector.`,
 		Example: `  # Display and verify the trust chain using identity controller
   linkerd trust chain
@@ -560,8 +562,10 @@ pod name or use a label selector.`,
 				return err
 			}
 
-			// Read identity issuer from Secret (always from control plane namespace)
-			issuerSecretCert, err := utils.GetCertFromSecret(ctx, k8sAPI, controlPlaneNamespace, utils.IdentityIssuerSecretName)
+			// Read identity issuer from Secret (always from control plane namespace).
+			// For a federated issuer this is a bundle: the issuer certificate
+			// plus the intermediate CAs above it, ordered leaf to root.
+			issuerSecretCerts, err := utils.GetCertsFromSecret(ctx, k8sAPI, controlPlaneNamespace, utils.IdentityIssuerSecretName)
 			if err != nil {
 				return err
 			}
@@ -601,6 +605,16 @@ pod name or use a label selector.`,
 				}
 			}
 
+			// Build the issuer chain: the issuer that signs the workload,
+			// up through any intermediates in the Secret's bundle.
+			issuerChain, err := utils.FindIssuerChain(workloadCert, issuerSecretCerts)
+			if err != nil {
+				return err
+			}
+			issuerCert := issuerChain[0]
+			chainTop := issuerChain[len(issuerChain)-1]
+			numIntermediates := len(issuerChain) - 1
+
 			// Verify that identity issuers match
 			fmt.Println("Trust Chain Verification")
 			fmt.Println("========================")
@@ -609,7 +623,7 @@ pod name or use a label selector.`,
 			errors := []string{}
 
 			// Verify identity issuer from secret matches the one from proxy
-			issuerSecretSKI := utils.GetSubjectKeyID(issuerSecretCert)
+			issuerSecretSKI := utils.GetSubjectKeyID(issuerCert)
 			identityIssuerFromProxySKI := utils.GetSubjectKeyID(identityIssuerFromProxy)
 
 			if issuerSecretSKI != identityIssuerFromProxySKI {
@@ -618,28 +632,40 @@ pod name or use a label selector.`,
 				fmt.Printf("✓ Identity issuer from Secret matches issuer from proxy (SKI: %s)\n", issuerSecretSKI)
 			}
 
-			// Verify trust bundle signs the identity issuer
-			trustBundleSignsIssuer := false
+			// Verify trust bundle anchors the issuer chain. The trust bundle
+			// must sign the topmost certificate in the Secret's bundle: for a
+			// classic issuer that's the issuer itself, for a federated issuer
+			// it's the topmost intermediate.
+			trustBundleAnchorsChain := false
 			var signingRoot *x509.Certificate
 			for _, trustCert := range trustBundleCerts {
-				if utils.VerifyCertSignedBy(issuerSecretCert, trustCert) {
-					trustBundleSignsIssuer = true
+				if utils.VerifyCertSignedBy(chainTop, trustCert) {
+					trustBundleAnchorsChain = true
 					signingRoot = trustCert
 					break
 				}
 			}
 
-			if !trustBundleSignsIssuer {
-				errors = append(errors, "❌ No certificate in trust bundle signs the identity issuer")
+			if !trustBundleAnchorsChain {
+				if numIntermediates > 0 {
+					errors = append(errors, fmt.Sprintf("❌ No certificate in trust bundle signs %s (top of the identity issuer chain)", chainTop.Subject.CommonName))
+				} else {
+					errors = append(errors, "❌ No certificate in trust bundle signs the identity issuer")
+				}
+			} else if numIntermediates > 0 {
+				fmt.Printf("✓ Trust anchor %s signs identity issuer %s through %d intermediate(s)\n", signingRoot.Subject.CommonName, issuerCert.Subject.CommonName, numIntermediates)
+				for i := 1; i < len(issuerChain); i++ {
+					fmt.Printf("  %s signs %s ✓\n", issuerChain[i].Subject.CommonName, issuerChain[i-1].Subject.CommonName)
+				}
 			} else {
-				fmt.Printf("✓ Trust anchor %s signs identity issuer %s\n", signingRoot.Subject.CommonName, issuerSecretCert.Subject.CommonName)
+				fmt.Printf("✓ Trust anchor %s signs identity issuer %s\n", signingRoot.Subject.CommonName, issuerCert.Subject.CommonName)
 			}
 
 			// Verify identity issuer signs workload cert
-			if !utils.VerifyCertSignedBy(workloadCert, issuerSecretCert) {
+			if !utils.VerifyCertSignedBy(workloadCert, issuerCert) {
 				errors = append(errors, "❌ Identity issuer does not sign workload certificate")
 			} else {
-				fmt.Printf("✓ Identity issuer %s signs workload certificate\n", issuerSecretCert.Subject.CommonName)
+				fmt.Printf("✓ Identity issuer %s signs workload certificate\n", issuerCert.Subject.CommonName)
 			}
 
 			fmt.Println()
@@ -665,11 +691,22 @@ pod name or use a label selector.`,
 				}
 
 				fmt.Printf("\nIdentity Issuer (in Secret %s):\n\n", utils.IdentityIssuerSecretName)
-				result, err := certinfo.CertificateText(issuerSecretCert)
-				if err != nil {
-					return fmt.Errorf("failed to format issuer certificate: %w", err)
+				for i, cert := range issuerSecretCerts {
+					if len(issuerSecretCerts) > 1 {
+						fmt.Printf("[%d] %s\n", i+1, cert.Subject.CommonName)
+						if cert.Equal(issuerCert) {
+							fmt.Println("(Signs workload certificates ✓)")
+						} else if cert.Equal(chainTop) {
+							fmt.Println("(Top of identity issuer chain)")
+						}
+						fmt.Println()
+					}
+					result, err := certinfo.CertificateText(cert)
+					if err != nil {
+						return fmt.Errorf("failed to format issuer certificate: %w", err)
+					}
+					fmt.Print(result)
 				}
-				fmt.Print(result)
 
 				fmt.Println("\nWorkload Certificate:")
 				if len(workloadCert.URIs) > 0 {
@@ -677,7 +714,7 @@ pod name or use a label selector.`,
 				} else {
 					fmt.Println()
 				}
-				result, err = certinfo.CertificateText(workloadCert)
+				result, err := certinfo.CertificateText(workloadCert)
 				if err != nil {
 					return fmt.Errorf("failed to format workload certificate: %w", err)
 				}
@@ -691,16 +728,32 @@ pod name or use a label selector.`,
 					fmt.Printf("      SKI: %s\n", ski)
 					fmt.Printf("      Valid: %s to %s\n", cert.NotBefore.Format("2006-01-02"), cert.NotAfter.Format("2006-01-02"))
 					if signingRoot != nil && ski == utils.GetSubjectKeyID(signingRoot) {
-						fmt.Println("      └─> Signs identity issuer ✓")
+						if numIntermediates > 0 {
+							fmt.Printf("      └─> Anchors identity issuer chain (%d intermediate(s)) ✓\n", numIntermediates)
+						} else {
+							fmt.Println("      └─> Signs identity issuer ✓")
+						}
+					}
+				}
+
+				if numIntermediates > 0 {
+					fmt.Println()
+					fmt.Println("Identity Issuer Intermediates (in Secret):")
+					for i, cert := range issuerChain[1:] {
+						fmt.Printf("  [%d] %s\n", i+1, cert.Subject.CommonName)
+						fmt.Printf("      SKI: %s\n", utils.GetSubjectKeyID(cert))
+						fmt.Printf("      AKI: %s\n", utils.GetAuthorityKeyID(cert))
+						fmt.Printf("      Valid: %s to %s\n", cert.NotBefore.Format("2006-01-02"), cert.NotAfter.Format("2006-01-02"))
+						fmt.Printf("      └─> Signs %s ✓\n", issuerChain[i].Subject.CommonName)
 					}
 				}
 
 				fmt.Println()
 				fmt.Printf("Identity Issuer (in Secret %s):\n", utils.IdentityIssuerSecretName)
-				fmt.Printf("  %s\n", issuerSecretCert.Subject.CommonName)
+				fmt.Printf("  %s\n", issuerCert.Subject.CommonName)
 				fmt.Printf("  SKI: %s\n", issuerSecretSKI)
-				fmt.Printf("  AKI: %s\n", utils.GetAuthorityKeyID(issuerSecretCert))
-				fmt.Printf("  Valid: %s to %s\n", issuerSecretCert.NotBefore.Format("2006-01-02"), issuerSecretCert.NotAfter.Format("2006-01-02"))
+				fmt.Printf("  AKI: %s\n", utils.GetAuthorityKeyID(issuerCert))
+				fmt.Printf("  Valid: %s to %s\n", issuerCert.NotBefore.Format("2006-01-02"), issuerCert.NotAfter.Format("2006-01-02"))
 				fmt.Println("  └─> Signs workload certificates ✓")
 
 				fmt.Println()
