@@ -182,6 +182,29 @@ The command validates that:
 				fmt.Printf("✓ Certificate is signed by trust anchor: %s\n", signingCert.Subject.CommonName)
 			}
 
+			// A chain certificate that is also in the trust bundle is worth
+			// flagging. A self-signed bundle certificate in the chain is
+			// simply redundant -- the control plane treats the bundle as
+			// roots, so the chain could end below it -- while a non
+			// self-signed one may be intentional: in the federated-anchor
+			// pattern, the Secret's chain deliberately carries a
+			// cluster-local anchor that is also in the trust bundle.
+			// Either way this is a warning, not an error: nothing is
+			// trimmed from the chain the user asked to install.
+			for _, chainCert := range chainCerts[1:] {
+				for _, trustCert := range trustBundleCerts {
+					if !chainCert.Equal(trustCert) {
+						continue
+					}
+					if chainCert.CheckSignatureFrom(chainCert) == nil {
+						fmt.Printf("⚠ %s is a self-signed trust anchor in the trust bundle; it does not need to be included in the Secret's certificate chain\n", chainCert.Subject.CommonName)
+					} else {
+						fmt.Printf("Note: %s is in the trust bundle as well as the Secret's certificate chain (cluster-local anchor); keeping it in the chain\n", chainCert.Subject.CommonName)
+					}
+					break
+				}
+			}
+
 			// Get or create the Secret
 			secret, err := k8sAPI.CoreV1().Secrets(controlPlaneNamespace).Get(ctx, secretName, metav1.GetOptions{})
 			var isNewSecret bool
