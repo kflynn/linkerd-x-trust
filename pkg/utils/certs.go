@@ -194,13 +194,31 @@ func publicKeyMatches(cert *x509.Certificate, privateKey crypto.PrivateKey) bool
 // is ambiguous during rotation, when an old and a replacement certificate
 // share a subject. Chain assembly verifies signatures instead.
 
+// canSignCerts reports whether cert may act as a CA in an issuer chain: it
+// must assert basicConstraints CA:TRUE and, if it declares any key usage,
+// that usage must include certificate signing. This mirrors the constraints
+// the identity controller places on chain intermediates, so that chains
+// routed through non-CA certificates -- e.g. workload certificates, which
+// every mesh participant holds -- are rejected by the CLI instead of by the
+// control plane at startup.
+func canSignCerts(cert *x509.Certificate) bool {
+	if !cert.BasicConstraintsValid || !cert.IsCA {
+		return false
+	}
+	if cert.KeyUsage != 0 && cert.KeyUsage&x509.KeyUsageCertSign == 0 {
+		return false
+	}
+	return true
+}
+
 // AssembleIssuerChain orders certificates into a leaf-first issuer chain
 // starting at leaf, by verifying that each certificate is signed by the one
-// above it. The chain ends when no given certificate signs the current head
-// (the trust bundle takes over above that point). Certificates outside the
-// chain -- e.g. the next generation's material during rotation -- are simply
-// not included; the caller validates them with ValidateRotationCerts.
-// Duplicate certificates are collapsed.
+// above it. Only certificates that may act as CAs (see canSignCerts) are
+// followed upward. The chain ends when no given certificate signs the
+// current head (the trust bundle takes over above that point). Certificates
+// outside the chain -- e.g. the next generation's material during rotation
+// -- are simply not included; the caller validates them with
+// ValidateRotationCerts. Duplicate certificates are collapsed.
 func AssembleIssuerChain(leaf *x509.Certificate, certs []*x509.Certificate) []*x509.Certificate {
 	chain := []*x509.Certificate{leaf}
 	inChain := map[string]bool{string(leaf.Raw): true}
@@ -211,6 +229,9 @@ func AssembleIssuerChain(leaf *x509.Certificate, certs []*x509.Certificate) []*x
 		var next *x509.Certificate
 		for _, cert := range certs {
 			if inChain[string(cert.Raw)] {
+				continue
+			}
+			if !canSignCerts(cert) {
 				continue
 			}
 			if VerifyCertSignedBy(current, cert) {
@@ -261,6 +282,12 @@ func certReachesTrustBundle(cert *x509.Certificate, certs, trustBundle []*x509.C
 		var next *x509.Certificate
 		for _, c := range certs {
 			if bytes.Equal(c.Raw, current.Raw) {
+				continue
+			}
+			// Only CA certificates may vouch for another certificate; a
+			// non-CA certificate (e.g. a workload certificate) signing
+			// something is not a link in an issuer chain.
+			if !canSignCerts(c) {
 				continue
 			}
 			if VerifyCertSignedBy(current, c) {
@@ -387,7 +414,8 @@ func FindIssuerChain(workloadCert *x509.Certificate, issuerCerts []*x509.Certifi
 	}
 
 	// Walk upward from the issuer through the Secret's certificates until
-	// we reach a self-signed certificate or run out of issuers.
+	// we reach a self-signed certificate or run out of issuers. Only
+	// certificates that may act as CAs (see canSignCerts) are followed.
 	for len(chain) < len(issuerCerts) {
 		current := chain[len(chain)-1]
 
@@ -399,6 +427,9 @@ func FindIssuerChain(workloadCert *x509.Certificate, issuerCerts []*x509.Certifi
 		found := false
 		for _, cert := range issuerCerts {
 			if cert.Equal(current) {
+				continue
+			}
+			if !canSignCerts(cert) {
 				continue
 			}
 			if VerifyCertSignedBy(current, cert) {
@@ -423,6 +454,15 @@ func FindIssuerChain(workloadCert *x509.Certificate, issuerCerts []*x509.Certifi
 // and that its topmost certificate is signed by a certificate in the trust
 // bundle. It returns the trust bundle certificate that anchors the chain.
 //
+// Beyond the signature checks, the chain is verified exactly as the
+// identity controller verifies the issuer Secret at startup: the chain
+// above the leaf is used as intermediates and the trust bundle as roots.
+// This enforces the X.509 constraints that signature checks alone miss --
+// intermediates must be CA certificates with the certificate-signing key
+// usage, certificates must be within their validity period, and path
+// length constraints must hold -- so that chains the control plane would
+// reject fail here, at input time, instead of at rollout.
+//
 // For a classic identity issuer the chain is a single certificate signed
 // directly by a trust anchor; for a federated issuer it is the issuer
 // certificate followed by one or more intermediate CA certificates, with
@@ -439,10 +479,33 @@ func VerifyChainAnchored(chain, trustBundle []*x509.Certificate) (*x509.Certific
 		}
 	}
 
-	// The topmost certificate must be signed by a trust bundle certificate.
+	leaf := chain[0]
+
+	// Run the control plane's verification: the chain above the leaf as
+	// intermediates, the trust bundle as roots.
+	roots := x509.NewCertPool()
+	for _, trustCert := range trustBundle {
+		roots.AddCert(trustCert)
+	}
+	intermediates := x509.NewCertPool()
+	for _, cert := range chain[1:] {
+		intermediates.AddCert(cert)
+	}
+	if _, err := leaf.Verify(x509.VerifyOptions{Roots: roots, Intermediates: intermediates}); err != nil {
+		return nil, fmt.Errorf("certificate chain for %s is not valid against the trust bundle (the identity controller would reject it): %w", leaf.Subject.CommonName, err)
+	}
+
+	// The leaf is installed as the identity issuer; the control plane
+	// requires the issuer to be a CA.
+	if !leaf.BasicConstraintsValid || !leaf.IsCA {
+		return nil, fmt.Errorf("certificate %s is not a CA, but the identity issuer must be a CA", leaf.Subject.CommonName)
+	}
+
+	// Identify the trust bundle certificate that anchors the chain, for
+	// reporting.
 	top := chain[len(chain)-1]
 	for _, trustCert := range trustBundle {
-		if VerifyCertSignedBy(top, trustCert) {
+		if top.Equal(trustCert) || VerifyCertSignedBy(top, trustCert) {
 			return trustCert, nil
 		}
 	}

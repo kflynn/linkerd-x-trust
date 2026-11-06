@@ -92,6 +92,12 @@ issuer. `linkerd x-trust` enforces the following constraints:
 - The private key must match one of the certificates given.
 - All the certificates must be signed either by a key in the cluster's
   trust bundle, or by another certificate given on the command line.
+- Certificates acting as issuers -- the selected certificate and
+  everything above it in its chain -- must be CA certificates, and the
+  full chain is validated exactly as the identity controller validates it
+  at startup (validity periods, key usage, and path length constraints
+  included). A certificate vouched for only by a non-CA certificate (for
+  example, a workload certificate) is rejected.
 
 Identity issuer bundles are useful when organizational policy requires an
 intermediate CA cert between the trust anchor and the identity issuer,

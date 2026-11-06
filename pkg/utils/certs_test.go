@@ -3,6 +3,7 @@ package utils
 import (
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -647,5 +648,125 @@ func TestAssembleIssuerChainWithRoot(t *testing.T) {
 	if !chain[0].Equal(issuer) || !chain[1].Equal(clusterAnchor) || !chain[2].Equal(root) {
 		t.Errorf("chain should be issuer -> cluster anchor -> root, got %s -> %s -> %s",
 			chain[0].Subject.CommonName, chain[1].Subject.CommonName, chain[2].Subject.CommonName)
+	}
+}
+
+// buildAttackChain builds the material a mesh participant could assemble
+// from nothing but an ordinary workload certificate: a new keypair and
+// certificate rogue, signed by the workload certificate's key. If chain
+// assembly accepted the workload certificate as an intermediate, the rogue
+// certificate could be installed as the identity issuer.
+func buildAttackChain(t *testing.T) (rogue, workload, issuer, clusterAnchor *x509.Certificate) {
+	t.Helper()
+
+	workload, issuerCK, clusterCK, _ := buildFederatedChainCK(t)
+	issuer, clusterAnchor = issuerCK.Certificate, clusterCK.Certificate
+
+	// A non-CA certificate with its private key, like a workload
+	// certificate every mesh pod holds.
+	workloadKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate workload key: %v", err)
+	}
+	workload, err = signCert(issuerCK, "workload.default.serviceaccount.identity.linkerd.cluster.local", &workloadKey.PublicKey, false)
+	if err != nil {
+		t.Fatalf("failed to generate workload certificate: %v", err)
+	}
+
+	// The rogue "issuer" certificate, signed by the workload certificate.
+	rogueKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate rogue key: %v", err)
+	}
+	rogue, err = signCert(&ourx509.CertAndKey{Certificate: workload, PrivateKey: workloadKey}, "rogue.linkerd.cluster.local", &rogueKey.PublicKey, true)
+	if err != nil {
+		t.Fatalf("failed to generate rogue certificate: %v", err)
+	}
+
+	return rogue, workload, issuer, clusterAnchor
+}
+
+// signCert creates a certificate for pub signed by ca, which is a CA when
+// isCA is set and a plain end-entity certificate otherwise.
+func signCert(ca *ourx509.CertAndKey, cn string, pub crypto.PublicKey, isCA bool) (*x509.Certificate, error) {
+	signer, ok := ca.PrivateKey.(crypto.Signer)
+	if !ok {
+		return nil, fmt.Errorf("CA private key is not a crypto.Signer (%T)", ca.PrivateKey)
+	}
+
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, err
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject:      pkix.Name{CommonName: cn},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	if isCA {
+		template.KeyUsage = x509.KeyUsageCertSign
+		template.BasicConstraintsValid = true
+		template.IsCA = true
+	} else {
+		template.KeyUsage = x509.KeyUsageDigitalSignature
+		template.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth}
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, template, ca.Certificate, pub, signer)
+	if err != nil {
+		return nil, err
+	}
+	return x509.ParseCertificate(der)
+}
+
+func TestAssembleIssuerChainRejectsNonCAIssuer(t *testing.T) {
+	// The workload certificate signs the rogue certificate, but it is not a
+	// CA, so the chain must not be routed through it: the rogue certificate
+	// ends up alone, unanchored.
+	rogue, workload, issuer, clusterAnchor := buildAttackChain(t)
+
+	chain := AssembleIssuerChain(rogue, []*x509.Certificate{rogue, workload, issuer, clusterAnchor})
+	if len(chain) != 1 || !chain[0].Equal(rogue) {
+		t.Fatalf("chain must not include the non-CA workload certificate, got %d certificate(s)", len(chain))
+	}
+}
+
+func TestVerifyChainAnchoredNonCAIntermediate(t *testing.T) {
+	// Even if such a chain is handed to VerifyChainAnchored directly, the
+	// control-plane-style verification must reject it: the workload
+	// certificate is not a CA.
+	rogue, workload, issuer, clusterAnchor := buildAttackChain(t)
+
+	_, err := VerifyChainAnchored([]*x509.Certificate{rogue, workload, issuer}, []*x509.Certificate{clusterAnchor})
+	if err == nil {
+		t.Fatal("expected an error for a chain routed through a non-CA certificate")
+	}
+}
+
+func TestVerifyChainAnchoredNonCALeaf(t *testing.T) {
+	// Installing a workload certificate (a non-CA) as the identity issuer
+	// must be rejected, as the control plane rejects it.
+	_, workload, issuer, clusterAnchor := buildAttackChain(t)
+
+	_, err := VerifyChainAnchored([]*x509.Certificate{workload, issuer}, []*x509.Certificate{clusterAnchor})
+	if err == nil {
+		t.Fatal("expected an error for a non-CA leaf certificate")
+	}
+}
+
+func TestValidateRotationCertsNonCAVouching(t *testing.T) {
+	// A non-CA certificate may not vouch for other certificates as rotation
+	// material: the rogue certificate, signed only by the workload
+	// certificate, must not reach the trust bundle.
+	rogue, workload, issuer, clusterAnchor := buildAttackChain(t)
+
+	err := ValidateRotationCerts([]*x509.Certificate{rogue, workload, issuer}, []*x509.Certificate{clusterAnchor})
+	if err == nil {
+		t.Fatal("expected an error when a certificate is vouched for only by a non-CA certificate")
+	}
+	if !strings.Contains(err.Error(), "rogue.linkerd.cluster.local") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
