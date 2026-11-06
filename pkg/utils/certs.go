@@ -92,10 +92,10 @@ func LoadCertAndKeyFromPaths(certPath, keyPath string) (*pkgtls.Cred, string, st
 // allCerts so the caller can validate them against the trust bundle (see
 // ValidateRotationCerts).
 //
-// It returns the leaf's credentials, the leaf-first chain as canonical PEM
-// (this is what gets written to the Secret), the key PEM, and every
-// certificate that was given.
-func LoadIssuerChainFromPaths(certPaths []string, keyPath string) (*pkgtls.Cred, string, string, []*x509.Certificate, error) {
+// It returns the leaf-first chain (the leaf to install is chain[0], and
+// this is what gets written to the Secret), the chain as canonical PEM,
+// the key PEM, and every certificate that was given.
+func LoadIssuerChainFromPaths(certPaths []string, keyPath string) ([]*x509.Certificate, string, string, []*x509.Certificate, error) {
 	if len(certPaths) == 0 {
 		return nil, "", "", nil, fmt.Errorf("at least one certificate file is required")
 	}
@@ -140,18 +140,10 @@ func LoadIssuerChainFromPaths(certPaths []string, keyPath string) (*pkgtls.Cred,
 
 	chain := AssembleIssuerChain(leaf, certs)
 
-	var chainPEM strings.Builder
-	for _, cert := range chain {
-		chainPEM.WriteString(pkgtls.EncodeCertificatesPEM(cert))
-	}
-	certData := chainPEM.String()
+	// This is what gets written to the Secret: the chain, leaf first.
+	certData := pkgtls.EncodeCertificatesPEM(chain...)
 
-	cred, err := pkgtls.ValidateAndCreateCreds(certData, string(keyData))
-	if err != nil {
-		return nil, "", "", nil, fmt.Errorf("failed to validate certificate and key: %w", err)
-	}
-
-	return cred, certData, string(keyData), certs, nil
+	return chain, certData, string(keyData), certs, nil
 }
 
 // parsePrivateKeyPEM parses an EC, RSA, or PKCS#8 private key from PEM.

@@ -141,7 +141,7 @@ The command validates that:
 			// certificates are ordered into an issuer chain above it.
 			// This happens before any cluster interaction, so local
 			// errors are reported without needing cluster access.
-			cred, certData, keyData, allCerts, err := utils.LoadIssuerChainFromPaths(certFiles, keyFile)
+			chainCerts, certData, keyData, allCerts, err := utils.LoadIssuerChainFromPaths(certFiles, keyFile)
 			if err != nil {
 				return fmt.Errorf("failed to load certificate and key: %w", err)
 			}
@@ -153,16 +153,8 @@ The command validates that:
 
 			ctx := cmd.Context()
 
-			// Get the issuer certificate
-			issuerCert := cred.Certificate
-
-			// Build the leaf-to-root chain from the loaded credentials.
-			// (Cred.TrustChain is stored root at the head, so reverse it.)
-			chainCerts := make([]*x509.Certificate, 0, len(cred.TrustChain)+1)
-			chainCerts = append(chainCerts, cred.Certificate)
-			for i := len(cred.TrustChain) - 1; i >= 0; i-- {
-				chainCerts = append(chainCerts, cred.TrustChain[i])
-			}
+			// The issuer to install is the chain's leaf.
+			issuerCert := chainCerts[0]
 
 			// Get trust bundle
 			trustBundleCerts, err := utils.GetTrustBundleCerts(ctx, k8sAPI, controlPlaneNamespace, utils.TrustRootsConfigMapName)

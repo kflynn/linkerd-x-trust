@@ -290,9 +290,10 @@ func TestVerifyChainAnchoredNotAnchored(t *testing.T) {
 	}
 }
 
-func TestLoadCertAndKeyFromPathsBundle(t *testing.T) {
+func TestLoadIssuerChainFromPathsBundleFile(t *testing.T) {
 	// A federated issuer "cert file" is a leaf-first bundle; loading it
-	// with the key must succeed with the leaf as the certificate.
+	// with the key must succeed with the leaf as the chain's first
+	// certificate.
 	_, issuerCK, clusterCK, _ := buildFederatedChainCK(t)
 	issuer, clusterAnchor := issuerCK.Certificate, clusterCK.Certificate
 
@@ -314,15 +315,21 @@ func TestLoadCertAndKeyFromPathsBundle(t *testing.T) {
 		t.Fatalf("failed to write key: %v", err)
 	}
 
-	cred, _, _, err := LoadCertAndKeyFromPaths(bundlePath, keyPath)
+	chain, certData, _, _, err := LoadIssuerChainFromPaths([]string{bundlePath}, keyPath)
 	if err != nil {
-		t.Fatalf("LoadCertAndKeyFromPaths failed on a bundle: %v", err)
+		t.Fatalf("LoadIssuerChainFromPaths failed on a bundle file: %v", err)
 	}
-	if !cred.Certificate.Equal(issuer) {
-		t.Errorf("leaf certificate should be the identity issuer, got %s", cred.Certificate.Subject.CommonName)
+	if len(chain) != 2 || !chain[0].Equal(issuer) || !chain[1].Equal(clusterAnchor) {
+		t.Errorf("chain should be issuer then cluster anchor, got %d certificate(s)", len(chain))
 	}
-	if len(cred.TrustChain) != 1 || !cred.TrustChain[0].Equal(clusterAnchor) {
-		t.Errorf("trust chain should contain the cluster anchor, got %d certificate(s)", len(cred.TrustChain))
+
+	// The written chain must round-trip leaf-first.
+	decoded, err := pkgtls.DecodePEMCertificates(certData)
+	if err != nil {
+		t.Fatalf("failed to decode chain PEM: %v", err)
+	}
+	if len(decoded) != 2 || !decoded[0].Equal(issuer) || !decoded[1].Equal(clusterAnchor) {
+		t.Errorf("chain PEM should be issuer then cluster anchor, got %d certificate(s)", len(decoded))
 	}
 }
 
@@ -358,28 +365,25 @@ func TestLoadIssuerChainFromPathsMultiFile(t *testing.T) {
 	}
 
 	// Scrambled file order: the leaf is not the first file given.
-	cred, certData, keyData, _, err := LoadIssuerChainFromPaths([]string{clusterPath, issuerPath}, keyPath)
+	chain, certData, keyData, _, err := LoadIssuerChainFromPaths([]string{clusterPath, issuerPath}, keyPath)
 	if err != nil {
 		t.Fatalf("LoadIssuerChainFromPaths failed: %v", err)
 	}
 
-	if !cred.Certificate.Equal(issuer) {
-		t.Errorf("leaf certificate should be the identity issuer, got %s", cred.Certificate.Subject.CommonName)
-	}
-	if len(cred.TrustChain) != 1 || !cred.TrustChain[0].Equal(clusterAnchor) {
-		t.Errorf("trust chain should contain the cluster anchor, got %d certificate(s)", len(cred.TrustChain))
+	if len(chain) != 2 || !chain[0].Equal(issuer) || !chain[1].Equal(clusterAnchor) {
+		t.Errorf("chain should be issuer then cluster anchor, got %d certificate(s)", len(chain))
 	}
 	if keyData != keyPEM {
 		t.Error("key data should be returned unchanged")
 	}
 
 	// The written chain must be leaf-first regardless of input order.
-	chain, err := pkgtls.DecodePEMCertificates(certData)
+	decoded, err := pkgtls.DecodePEMCertificates(certData)
 	if err != nil {
 		t.Fatalf("failed to decode chain PEM: %v", err)
 	}
-	if len(chain) != 2 || !chain[0].Equal(issuer) || !chain[1].Equal(clusterAnchor) {
-		t.Errorf("chain PEM should be issuer then cluster anchor, got %d certificate(s)", len(chain))
+	if len(decoded) != 2 || !decoded[0].Equal(issuer) || !decoded[1].Equal(clusterAnchor) {
+		t.Errorf("chain PEM should be issuer then cluster anchor, got %d certificate(s)", len(decoded))
 	}
 }
 
@@ -401,15 +405,12 @@ func TestLoadIssuerChainFromPathsSingleFile(t *testing.T) {
 		t.Fatalf("failed to write key: %v", err)
 	}
 
-	cred, _, _, _, err := LoadIssuerChainFromPaths([]string{issuerPath}, keyPath)
+	chain, _, _, _, err := LoadIssuerChainFromPaths([]string{issuerPath}, keyPath)
 	if err != nil {
 		t.Fatalf("LoadIssuerChainFromPaths failed: %v", err)
 	}
-	if !cred.Certificate.Equal(issuerCK.Certificate) {
-		t.Errorf("leaf certificate should be the identity issuer, got %s", cred.Certificate.Subject.CommonName)
-	}
-	if len(cred.TrustChain) != 0 {
-		t.Errorf("single certificate should have no trust chain, got %d", len(cred.TrustChain))
+	if len(chain) != 1 || !chain[0].Equal(issuerCK.Certificate) {
+		t.Errorf("chain should hold just the issuer, got %d certificate(s)", len(chain))
 	}
 }
 
@@ -470,15 +471,12 @@ func TestLoadIssuerChainFromPathsKeySelectsIntermediate(t *testing.T) {
 		t.Fatalf("failed to write key: %v", err)
 	}
 
-	cred, _, _, allCerts, err := LoadIssuerChainFromPaths([]string{issuerPath, clusterPath}, keyPath)
+	chain, _, _, allCerts, err := LoadIssuerChainFromPaths([]string{issuerPath, clusterPath}, keyPath)
 	if err != nil {
 		t.Fatalf("LoadIssuerChainFromPaths failed: %v", err)
 	}
-	if !cred.Certificate.Equal(clusterCK.Certificate) {
-		t.Errorf("the key should select the cluster anchor, got %s", cred.Certificate.Subject.CommonName)
-	}
-	if len(cred.TrustChain) != 0 {
-		t.Errorf("cluster anchor has no issuer among the given certs, got %d chain cert(s)", len(cred.TrustChain))
+	if len(chain) != 1 || !chain[0].Equal(clusterCK.Certificate) {
+		t.Errorf("the key should select the cluster anchor, got a chain of %d certificate(s)", len(chain))
 	}
 
 	// Both certs must still be connected to the trust bundle.
@@ -594,18 +592,15 @@ func TestLoadIssuerChainFromPathsRotationSameSubject(t *testing.T) {
 
 	// Stale anchor listed first, so position can't save us: signature
 	// verification must pick the anchor that actually signs the issuer.
-	cred, _, _, allCerts, err := LoadIssuerChainFromPaths([]string{oldPath, newPath, issuerPath}, keyPath)
+	chain, _, _, allCerts, err := LoadIssuerChainFromPaths([]string{oldPath, newPath, issuerPath}, keyPath)
 	if err != nil {
 		t.Fatalf("LoadIssuerChainFromPaths failed: %v", err)
 	}
-	if !cred.Certificate.Equal(rotatedIssuerCK.Certificate) {
-		t.Errorf("leaf should be the rotated issuer, got %s", cred.Certificate.Subject.CommonName)
+	if len(chain) != 2 || !chain[0].Equal(rotatedIssuerCK.Certificate) || !chain[1].Equal(rotatedCK.Certificate) {
+		t.Fatalf("chain must be the rotated issuer under the anchor that signs it, got %d certificate(s)", len(chain))
 	}
-	if len(cred.TrustChain) != 1 || !cred.TrustChain[0].Equal(rotatedCK.Certificate) {
-		t.Fatalf("trust chain must contain the anchor that signs the issuer (the rotated one), got %d certificate(s)", len(cred.TrustChain))
-	}
-	if cred.TrustChain[0].Equal(clusterCK.Certificate) {
-		t.Error("trust chain must not contain the stale same-subject anchor")
+	if chain[1].Equal(clusterCK.Certificate) {
+		t.Error("chain must not contain the stale same-subject anchor")
 	}
 
 	// All four certs (both generations) must reach the trust bundle.
