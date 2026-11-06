@@ -689,7 +689,11 @@ pod name or use a label selector.`,
 					ski := utils.GetSubjectKeyID(cert)
 					fmt.Printf("\n[%d] %s\n", i+1, cert.Subject.CommonName)
 					if signingRoot != nil && ski == utils.GetSubjectKeyID(signingRoot) {
-						fmt.Println("    (Signs identity issuer ✓)")
+						if numIntermediates > 0 {
+							fmt.Printf("    (Anchors identity issuer chain (%d intermediate(s)) ✓)\n", numIntermediates)
+						} else {
+							fmt.Println("    (Signs identity issuer ✓)")
+						}
 					}
 					fmt.Println()
 					result, err := certinfo.CertificateText(cert)
