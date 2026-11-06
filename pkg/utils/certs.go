@@ -3,11 +3,9 @@ package utils
 import (
 	"bytes"
 	"context"
-	"crypto"
 	"crypto/sha1"
 	"crypto/x509"
 	"encoding/hex"
-	"encoding/pem"
 	"fmt"
 	"os"
 	"strings"
@@ -87,8 +85,10 @@ func LoadIssuerChainFromPaths(certPaths []string, keyPath string) ([]*x509.Certi
 	if err != nil {
 		return nil, "", "", nil, fmt.Errorf("failed to read key file: %w", err)
 	}
-	privateKey, err := parsePrivateKeyPEM(string(keyData))
-	if err != nil {
+	// Parse the key with the same rules the control plane applies, so
+	// unsupported key types are rejected here, up front, rather than
+	// deep inside credential validation.
+	if _, err := pkgtls.DecodePEMKey(string(keyData)); err != nil {
 		return nil, "", "", nil, fmt.Errorf("failed to parse key file %s: %w", keyPath, err)
 	}
 
@@ -102,15 +102,18 @@ func LoadIssuerChainFromPaths(certPaths []string, keyPath string) ([]*x509.Certi
 		certs = append(certs, fileCerts...)
 	}
 
-	// The leaf certificate is the one matching the key.
+	// The leaf certificate is the one matching the key. pkgtls's
+	// ValidateAndCreateCreds is the single source of truth for
+	// key/certificate matching.
 	var leaf *x509.Certificate
 	for _, cert := range certs {
-		if publicKeyMatches(cert, privateKey) {
-			if leaf != nil {
-				return nil, "", "", nil, fmt.Errorf("the key matches more than one certificate (%s and %s)", leaf.Subject.CommonName, cert.Subject.CommonName)
-			}
-			leaf = cert
+		if _, err := pkgtls.ValidateAndCreateCreds(pkgtls.EncodeCertificatesPEM(cert), string(keyData)); err != nil {
+			continue
 		}
+		if leaf != nil {
+			return nil, "", "", nil, fmt.Errorf("the key matches more than one certificate (%s and %s)", leaf.Subject.CommonName, cert.Subject.CommonName)
+		}
+		leaf = cert
 	}
 	if leaf == nil {
 		return nil, "", "", nil, fmt.Errorf("the key in %s does not match any of the given certificates (the key must go with the leaf certificate)", keyPath)
@@ -122,42 +125,6 @@ func LoadIssuerChainFromPaths(certPaths []string, keyPath string) ([]*x509.Certi
 	certData := pkgtls.EncodeCertificatesPEM(chain...)
 
 	return chain, certData, string(keyData), certs, nil
-}
-
-// parsePrivateKeyPEM parses an EC, RSA, or PKCS#8 private key from PEM.
-func parsePrivateKeyPEM(pemData string) (crypto.PrivateKey, error) {
-	block, _ := pem.Decode([]byte(pemData))
-	if block == nil {
-		return nil, fmt.Errorf("no PEM data found")
-	}
-	switch block.Type {
-	case "EC PRIVATE KEY":
-		return x509.ParseECPrivateKey(block.Bytes)
-	case "RSA PRIVATE KEY":
-		return x509.ParsePKCS1PrivateKey(block.Bytes)
-	case "PRIVATE KEY":
-		return x509.ParsePKCS8PrivateKey(block.Bytes)
-	default:
-		return nil, fmt.Errorf("unsupported PEM block type %q (want EC PRIVATE KEY, RSA PRIVATE KEY, or PRIVATE KEY)", block.Type)
-	}
-}
-
-// publicKeyMatches reports whether the private key is the counterpart of the
-// certificate's public key.
-func publicKeyMatches(cert *x509.Certificate, privateKey crypto.PrivateKey) bool {
-	signer, ok := privateKey.(crypto.Signer)
-	if !ok {
-		return false
-	}
-	certPub, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
-	if err != nil {
-		return false
-	}
-	keyPub, err := x509.MarshalPKIXPublicKey(signer.Public())
-	if err != nil {
-		return false
-	}
-	return bytes.Equal(certPub, keyPub)
 }
 
 // CertIDsMatch is gone: identifier matching (issuer/subject DNs and key IDs)
