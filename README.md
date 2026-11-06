@@ -33,22 +33,23 @@ Another example: bootstrapping a completely empty cluster from the CLI:
 First, generate a trust anchor and an identity issuer.
 
 ```bash
-rm -rf certs
-mkdir certs
+rm -rf /tmp/certs
+mkdir /tmp/certs
 
 linkerd x-trust anchor generate \
-  certs/anchor.{crt,key}
+  /tmp/certs/anchor.{crt,key}
 
 linkerd x-trust issuer generate \
-  certs/anchor.{crt,key} \
-  certs/issuer.{crt,key}
+  /tmp/certs/anchor.{crt,key} \
+  /tmp/certs/issuer.{crt,key}
 ```
 
 Next, use these to bootstrap the trust hierarchy that Linkerd will use.
 
 ```bash
-linkerd x-trust bundle add --create certs/anchor.crt
-linkerd x-trust identity update --create certs/issuer.{crt,key}
+kubectl create namespace linkerd
+linkerd x-trust bundle add --create /tmp/certs/anchor.crt
+linkerd x-trust identity update --create /tmp/certs/issuer.{crt,key}
 ```
 
 Finally, install Linkerd with the external CA option. (Obviously you
