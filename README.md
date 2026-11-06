@@ -9,9 +9,11 @@ MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
 
 ## tl;dr:
 
-Build the extension with `make`, then copy the `linkerd-x-trust` binary
-somewhere in your `PATH`. After that, the `linkerd` CLI will have access
-to the `x-trust` command. Run
+The easiest way to install `linkerd x-trust` is to go to [the release
+page] and download the binary for your platform. Check it against
+`SHA256SUMS.txt`, then make it executable and put it somewhere on your
+`PATH`. After that, the `linkerd` CLI will have access to the `x-trust`
+command. Run
 
 ```bash
 linkerd x-trust --help
@@ -25,6 +27,12 @@ linkerd x-trust chain
 ```
 
 to get an overview of what your trust hierarchy looks like.
+
+(You can also, of course, clone this repo, build the extension with
+`make`, then move the `linkerd-x-trust` binary somewhere in your `PATH`.
+Downloading from the release page will likely be simpler, though.)
+
+[the release page]: https://github.com/kflynn/linkerd-x-trust/releases/
 
 ## Bootstrapping a Cluster
 
@@ -296,7 +304,7 @@ have go correctly set up:
 
 - To build, just run `make`.
 
-   - If needed, you can set `GOARCH` and `GOOS` as needed (e.g. `make GOOS=linux GOARCH=amd64`
+  - If needed, you can set `GOARCH` and `GOOS` as needed (e.g. `make GOOS=linux GOARCH=amd64`
      to cross-compile for an x86 Kubernetes environment on a Mac).
 
 - To clean everything up, use `make clean`.
