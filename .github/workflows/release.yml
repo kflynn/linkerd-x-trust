@@ -37,9 +37,10 @@ jobs:
             goarch: arm64
             ext: '.exe'
     steps:
-      - uses: actions/checkout@v4
+      # Pinned by commit SHA; bump comments when updating.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
@@ -54,7 +55,7 @@ jobs:
             ./cmd/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linkerd-x-trust-${{ matrix.goos }}-${{ matrix.goarch }}
           path: dist/*
@@ -66,9 +67,10 @@ jobs:
     # binary, only exists on macOS.
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      # Pinned by commit SHA; bump comments when updating.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
 
@@ -84,7 +86,7 @@ jobs:
             linkerd-x-trust-amd64 linkerd-x-trust-arm64
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linkerd-x-trust-darwin
           path: dist/*
@@ -96,7 +98,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac064aef8333 # v8.0.2
         with:
           path: dist
           merge-multiple: true
@@ -107,7 +109,7 @@ jobs:
           sha256sum linkerd-x-trust-* | tee SHA256SUMS.txt
 
       - name: Create draft release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           draft: true
           generate_release_notes: true
