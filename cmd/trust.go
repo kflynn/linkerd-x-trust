@@ -605,11 +605,22 @@ pod name or use a label selector.`,
 				}
 			}
 
+			errors := []string{}
+
 			// Build the issuer chain: the issuer that signs the workload,
-			// up through any intermediates in the Secret's bundle.
+			// up through any intermediates in the Secret's bundle. When no
+			// certificate in the Secret signs the workload certificate --
+			// e.g. the issuer was rotated while proxies still hold
+			// certificates from the old one -- that's exactly the
+			// misconfiguration this command exists to diagnose, so report
+			// it in the verification report rather than aborting: fall
+			// back to the Secret's first certificate as the presumed
+			// issuer and let the individual checks below report what's
+			// wrong.
 			issuerChain, err := utils.FindIssuerChain(workloadCert, issuerSecretCerts)
 			if err != nil {
-				return err
+				errors = append(errors, fmt.Sprintf("❌ %s", err))
+				issuerChain = []*x509.Certificate{issuerSecretCerts[0]}
 			}
 			issuerCert := issuerChain[0]
 			chainTop := issuerChain[len(issuerChain)-1]
@@ -619,8 +630,6 @@ pod name or use a label selector.`,
 			fmt.Println("Trust Chain Verification")
 			fmt.Println("========================")
 			fmt.Println()
-
-			errors := []string{}
 
 			// Verify identity issuer from secret matches the one from proxy
 			issuerSecretSKI := utils.GetSubjectKeyID(issuerCert)
