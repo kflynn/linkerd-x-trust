@@ -18,18 +18,12 @@ env:
 
 jobs:
   build:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
-          - goos: darwin
-            goarch: amd64
-            ext: ''
-          - goos: darwin
-            goarch: arm64
-            ext: ''
           - goos: linux
             goarch: amd64
             ext: ''
@@ -66,9 +60,39 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  build-darwin:
+    name: Build darwin (universal)
+    # lipo, which merges the amd64 and arm64 builds into one fat
+    # binary, only exists on macOS.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build universal binary
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            GOARCH=$arch go build -trimpath -ldflags "-s -w" \
+              -o "linkerd-x-trust-${arch}" \
+              ./cmd/
+          done
+          lipo -create -output "dist/linkerd-x-trust-${GITHUB_REF_NAME}-darwin" \
+            linkerd-x-trust-amd64 linkerd-x-trust-arm64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linkerd-x-trust-darwin
+          path: dist/*
+          if-no-files-found: error
+
   release:
     name: Draft release
-    needs: build
+    needs: [build, build-darwin]
     runs-on: ubuntu-latest
     steps:
       - name: Download artifacts
