@@ -58,28 +58,6 @@ func LoadCertsFromBundle(configMap *corev1.ConfigMap) (string, []*x509.Certifica
 	return existingBundle, existingCerts, nil
 }
 
-func LoadCertAndKeyFromPaths(certPath, keyPath string) (*pkgtls.Cred, string, string, error) {
-	// Read certificate file
-	certData, err := os.ReadFile(certPath)
-	if err != nil {
-		return nil, "", "", fmt.Errorf("failed to read certificate file: %w", err)
-	}
-
-	// Read key file
-	keyData, err := os.ReadFile(keyPath)
-	if err != nil {
-		return nil, "", "", fmt.Errorf("failed to read key file: %w", err)
-	}
-
-	// Parse certificate and key
-	cred, err := pkgtls.ValidateAndCreateCreds(string(certData), string(keyData))
-	if err != nil {
-		return nil, "", "", fmt.Errorf("failed to validate certificate and key: %w", err)
-	}
-
-	return cred, string(certData), string(keyData), nil
-}
-
 // LoadIssuerChainFromPaths loads an identity issuer chain from one or more
 // certificate files plus a single key file. The certificate files may each
 // hold a single certificate or a multi-certificate bundle, in any order: the
@@ -333,15 +311,6 @@ func GetTrustBundleCerts(ctx context.Context, k8sAPI *k8s.KubernetesAPI, namespa
 	}
 
 	return certs, nil
-}
-
-func GetCertFromSecret(ctx context.Context, k8sAPI *k8s.KubernetesAPI, namespace string, secretName string) (*x509.Certificate, error) {
-	certs, err := GetCertsFromSecret(ctx, k8sAPI, namespace, secretName)
-	if err != nil {
-		return nil, err
-	}
-
-	return certs[0], nil
 }
 
 // GetCertsFromSecret reads all certificates from a Secret's certificate
