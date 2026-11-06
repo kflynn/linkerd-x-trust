@@ -1,7 +1,6 @@
 package utils
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha1"
 	"crypto/x509"
@@ -148,6 +147,28 @@ func canSignCerts(cert *x509.Certificate) bool {
 	return true
 }
 
+// issuerOf returns the certificate in pool that signs current, skipping the
+// certificates in skip and any certificate that may not act as a CA (see
+// canSignCerts). It returns nil when no pool certificate qualifies.
+func issuerOf(current *x509.Certificate, pool, skip []*x509.Certificate) *x509.Certificate {
+	skipped := make(map[string]bool, len(skip))
+	for _, cert := range skip {
+		skipped[string(cert.Raw)] = true
+	}
+	for _, cert := range pool {
+		if skipped[string(cert.Raw)] {
+			continue
+		}
+		if !canSignCerts(cert) {
+			continue
+		}
+		if VerifyCertSignedBy(current, cert) {
+			return cert
+		}
+	}
+	return nil
+}
+
 // AssembleIssuerChain orders certificates into a leaf-first issuer chain
 // starting at leaf, by verifying that each certificate is signed by the one
 // above it. Only certificates that may act as CAs (see canSignCerts) are
@@ -158,29 +179,13 @@ func canSignCerts(cert *x509.Certificate) bool {
 // ValidateRotationCerts. Duplicate certificates are collapsed.
 func AssembleIssuerChain(leaf *x509.Certificate, certs []*x509.Certificate) []*x509.Certificate {
 	chain := []*x509.Certificate{leaf}
-	inChain := map[string]bool{string(leaf.Raw): true}
 
 	for {
-		current := chain[len(chain)-1]
-
-		var next *x509.Certificate
-		for _, cert := range certs {
-			if inChain[string(cert.Raw)] {
-				continue
-			}
-			if !canSignCerts(cert) {
-				continue
-			}
-			if VerifyCertSignedBy(current, cert) {
-				next = cert
-				break
-			}
-		}
+		next := issuerOf(chain[len(chain)-1], certs, chain)
 		if next == nil {
 			break
 		}
 		chain = append(chain, next)
-		inChain[string(next.Raw)] = true
 	}
 
 	return chain
@@ -216,22 +221,7 @@ func certReachesTrustBundle(cert *x509.Certificate, certs, trustBundle []*x509.C
 			}
 		}
 
-		var next *x509.Certificate
-		for _, c := range certs {
-			if bytes.Equal(c.Raw, current.Raw) {
-				continue
-			}
-			// Only CA certificates may vouch for another certificate; a
-			// non-CA certificate (e.g. a workload certificate) signing
-			// something is not a link in an issuer chain.
-			if !canSignCerts(c) {
-				continue
-			}
-			if VerifyCertSignedBy(current, c) {
-				next = c
-				break
-			}
-		}
+		next := issuerOf(current, certs, []*x509.Certificate{current})
 		if next == nil {
 			return fmt.Errorf("%s (SKI %s) is neither signed by another given certificate nor by a certificate in the trust bundle", current.Subject.CommonName, GetSubjectKeyID(current))
 		}
@@ -352,26 +342,13 @@ func FindIssuerChain(workloadCert *x509.Certificate, issuerCerts []*x509.Certifi
 			break
 		}
 
-		found := false
-		for _, cert := range issuerCerts {
-			if cert.Equal(current) {
-				continue
-			}
-			if !canSignCerts(cert) {
-				continue
-			}
-			if VerifyCertSignedBy(current, cert) {
-				chain = append(chain, cert)
-				found = true
-				break
-			}
-		}
-
-		if !found {
+		next := issuerOf(current, issuerCerts, []*x509.Certificate{current})
+		if next == nil {
 			// No certificate in the Secret signs the current one, so the
 			// chain ends here. The trust bundle is responsible for the rest.
 			break
 		}
+		chain = append(chain, next)
 	}
 
 	return chain, nil
